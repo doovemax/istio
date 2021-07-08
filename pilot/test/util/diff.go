@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,17 +18,26 @@ import (
 	"errors"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/pmezard/go-difflib/difflib"
+
+	"istio.io/istio/pkg/file"
+	"istio.io/pkg/env"
 )
+
+const (
+	statusReplacement = "sidecar.istio.io/status: '{\"version\":\"\","
+)
+
+var statusPattern = regexp.MustCompile("sidecar.istio.io/status: '{\"version\":\"([0-9a-f]+)\",")
 
 // Refresh controls whether to update the golden artifacts instead.
 // It is set using the environment variable REFRESH_GOLDEN.
 func Refresh() bool {
-	v, exists := os.LookupEnv("REFRESH_GOLDEN")
-	return exists && v == "true"
+	return env.RegisterBoolVar("REFRESH_GOLDEN", false, "").Get()
 }
 
 // Compare compares two byte slices. It returns an error with a
@@ -63,7 +72,7 @@ func CompareYAML(filename string, t *testing.T) {
 	goldenFile := filename + ".golden"
 	if Refresh() {
 		t.Logf("Refreshing golden file for %s", filename)
-		if err = ioutil.WriteFile(goldenFile, content, 0644); err != nil {
+		if err = ioutil.WriteFile(goldenFile, content, 0o644); err != nil {
 			t.Errorf(err.Error())
 		}
 	}
@@ -92,18 +101,23 @@ func ReadGoldenFile(content []byte, goldenFile string, t *testing.T) []byte {
 	return ReadFile(goldenFile, t)
 }
 
+// StripVersion strips the version fields of a YAML content.
+func StripVersion(yaml []byte) []byte {
+	return statusPattern.ReplaceAllLiteral(yaml, []byte(statusReplacement))
+}
+
 // RefreshGoldenFile updates the golden file with the given content
 func RefreshGoldenFile(content []byte, goldenFile string, t *testing.T) {
 	if Refresh() {
 		t.Logf("Refreshing golden file %s", goldenFile)
-		if err := ioutil.WriteFile(goldenFile, content, 0644); err != nil {
+		if err := file.AtomicWrite(goldenFile, content, os.FileMode(0o644)); err != nil {
 			t.Errorf(err.Error())
 		}
 	}
 }
 
 // ReadFile reads the content of the given file or fails the test if an error is encountered.
-func ReadFile(file string, t *testing.T) []byte {
+func ReadFile(file string, t testing.TB) []byte {
 	t.Helper()
 	golden, err := ioutil.ReadFile(file)
 	if err != nil {

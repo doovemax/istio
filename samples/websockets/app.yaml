@@ -4,6 +4,7 @@ metadata:
   name: tornado
   labels:
     app: tornado
+    service: tornado
 spec:
   ports:
   - port: 8888
@@ -11,12 +12,16 @@ spec:
   selector:
     app: tornado
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: tornado
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: tornado
+      version: v1
   template:
     metadata:
       labels:

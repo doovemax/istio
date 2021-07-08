@@ -1,44 +1,46 @@
-FROM istionightly/base_debug
+# BASE_DISTRIBUTION is used to switch between the old base distribution and distroless base images
+ARG BASE_DISTRIBUTION=default
+
+# Version is the base image version from the TLD Makefile
+ARG BASE_VERSION=latest
+
+# The following section is used as base image if BASE_DISTRIBUTION=default
+FROM gcr.io/istio-release/base:${BASE_VERSION} as default
+
+# The following section is used as base image if BASE_DISTRIBUTION=distroless
+# This image is a custom built debian10 distroless image with multiarchitecture support.
+# It is built on the base distroless image, with iptables binary and libraries added
+# The source can be found at https://github.com/istio/distroless/tree/iptables
+FROM gcr.io/istio-release/iptables@sha256:e8f940d0d0163ec4563ee070188c1d97308ac08f4a711152ff55f3a81e525140 as distroless
+
+# This will build the final image based on either default or distroless from above
+# hadolint ignore=DL3006
+FROM ${BASE_DISTRIBUTION}
+
+WORKDIR /
+
 ARG proxy_version
 ARG istio_version
+ARG SIDECAR=envoy
 
-ARG ISTIO_API_SHA=unknown
-ARG ENVOY_SHA=unknown
-LABEL istio-api-vcs-ref=$ISTIO_API_SHA \
-    envoy-vcs-ref=$ENVOY_SHA
+# Copy Envoy bootstrap templates used by pilot-agent
+COPY envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
+COPY gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
 
 # Install Envoy.
-ADD envoy /usr/local/bin/envoy
+COPY $SIDECAR /usr/local/bin/$SIDECAR
 
-# Environment variables indicating this proxy's version/capabilities as opaque string
-ENV ISTIO_META_ISTIO_PROXY_VERSION "1.1.0"
 # Environment variable indicating the exact proxy sha - for debugging or version-specific configs 
 ENV ISTIO_META_ISTIO_PROXY_SHA $proxy_version
 # Environment variable indicating the exact build, for debugging
 ENV ISTIO_META_ISTIO_VERSION $istio_version
 
-ADD pilot-agent /usr/local/bin/pilot-agent
+COPY pilot-agent /usr/local/bin/pilot-agent
 
-ADD envoy_pilot.yaml.tmpl /etc/istio/proxy/envoy_pilot.yaml.tmpl
-ADD envoy_policy.yaml.tmpl /etc/istio/proxy/envoy_policy.yaml.tmpl
-ADD envoy_telemetry.yaml.tmpl /etc/istio/proxy/envoy_telemetry.yaml.tmpl
-ADD istio-iptables.sh /usr/local/bin/istio-iptables.sh
-
-# Copy Envoy bootstrap templates used by pilot-agent
-COPY envoy_bootstrap_v2.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
-COPY envoy_bootstrap_drain.json /var/lib/istio/envoy/envoy_bootstrap_drain.json
-COPY gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
-
-# Add CA certificates for SSL connections.
-# obtained from debian ca-certs deb using fetch_cacerts.sh
-ADD ca-certificates.tgz /
-
-RUN chmod 755 /usr/local/bin/envoy /usr/local/bin/pilot-agent
-
-# Sudoers used to allow tcpdump and other debug utilities.
-RUN useradd -m --uid 1337 istio-proxy && \
-    echo "istio-proxy ALL=NOPASSWD: ALL" >> /etc/sudoers && \
-    chown -R istio-proxy /var/lib/istio
+COPY stats-filter.wasm /etc/istio/extensions/stats-filter.wasm
+COPY stats-filter.compiled.wasm /etc/istio/extensions/stats-filter.compiled.wasm
+COPY metadata-exchange-filter.wasm /etc/istio/extensions/metadata-exchange-filter.wasm
+COPY metadata-exchange-filter.compiled.wasm /etc/istio/extensions/metadata-exchange-filter.compiled.wasm
 
 # The pilot-agent will bootstrap Envoy.
 ENTRYPOINT ["/usr/local/bin/pilot-agent"]

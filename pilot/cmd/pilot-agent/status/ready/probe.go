@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,67 +15,117 @@
 package ready
 
 import (
-	"errors"
+	"context"
 	"fmt"
 
-	multierror "github.com/hashicorp/go-multierror"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 
+	"istio.io/istio/pilot/cmd/pilot-agent/metrics"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/util"
 )
 
 // Probe for readiness.
 type Probe struct {
-	AdminPort        uint16
-	ApplicationPorts []uint16
+	LocalHostAddr       string
+	AdminPort           uint16
+	receivedFirstUpdate bool
+	// Indicates that Envoy is ready atleast once so that we can cache and reuse that probe.
+	atleastOnceReady bool
+	Context          context.Context
+	// NoEnvoy so we only check config status
+	NoEnvoy bool
 }
 
-// Check executes the probe and returns an error is the probe fails.
+type Prober interface {
+	// Check executes the probe and returns an error if the probe fails.
+	Check() error
+}
+
+var _ Prober = &Probe{}
+
+// Check executes the probe and returns an error if the probe fails.
 func (p *Probe) Check() error {
-	if err := p.checkInboundConfigured(); err != nil {
+	// First, check that Envoy has received a configuration update from Pilot.
+	if err := p.checkConfigStatus(); err != nil {
 		return err
 	}
-
-	return p.checkUpdated()
+	return p.isEnvoyReady()
 }
 
-// checkApplicationPorts verifies that Envoy has received configuration for all ports exposed by the application container.
-func (p *Probe) checkInboundConfigured() error {
-	if len(p.ApplicationPorts) > 0 {
-		listeningPorts, listeners, err := util.GetInboundListeningPorts(p.AdminPort)
-		if err != nil {
-			return err
-		}
-
-		// Only those container ports exposed through the service receive a configuration from Pilot. Since we don't know
-		// which ports are defined by the service, just ensure that at least one container port has a cluster/listener
-		// confuration in Envoy. The CDS/LDS updates will contain everything, so just ensuring at least one port has
-		// been configured should be sufficient.
-		for _, appPort := range p.ApplicationPorts {
-			if listeningPorts[appPort] {
-				// Success - Envoy is configured.
-				return nil
-			}
-			err = multierror.Append(err, fmt.Errorf("envoy missing listener for inbound application port: %d", appPort))
-		}
-		if err != nil {
-			return multierror.Append(fmt.Errorf("failed checking application ports. listeners=%s", listeners), err)
-		}
+// checkConfigStatus checks to make sure initial configs have been received from Pilot.
+func (p *Probe) checkConfigStatus() error {
+	if p.NoEnvoy {
+		// TODO some way to verify XDS proxy -> control plane works
+		return nil
 	}
-	return nil
-}
+	if p.receivedFirstUpdate {
+		return nil
+	}
 
-// checkUpdated checks to make sure updates have been received from Pilot
-func (p *Probe) checkUpdated() error {
-	s, err := util.GetStats(p.AdminPort)
+	s, err := util.GetUpdateStatusStats(p.LocalHostAddr, p.AdminPort)
 	if err != nil {
 		return err
 	}
 
-	CDSUpdated := s.CDSUpdatesSuccess > 0 || s.CDSUpdatesRejection > 0
-	LDSUpdated := s.LDSUpdatesSuccess > 0 || s.LDSUpdatesRejection > 0
+	CDSUpdated := s.CDSUpdatesSuccess > 0
+	LDSUpdated := s.LDSUpdatesSuccess > 0
 	if CDSUpdated && LDSUpdated {
+		p.receivedFirstUpdate = true
 		return nil
 	}
 
-	return errors.New(s.String())
+	return fmt.Errorf("config not received from Pilot (is Pilot running?): %s", s.String())
+}
+
+// isEnvoyReady checks to ensure that Envoy is in the LIVE state and workers have started.
+func (p *Probe) isEnvoyReady() error {
+	if p.NoEnvoy {
+		return nil
+	}
+	if p.Context == nil {
+		return p.checkEnvoyReadiness()
+	}
+	select {
+	case <-p.Context.Done():
+		return fmt.Errorf("server is not live, current state is: %s", admin.ServerInfo_DRAINING.String())
+	default:
+		return p.checkEnvoyReadiness()
+	}
+}
+
+func (p *Probe) checkEnvoyReadiness() error {
+	// If Envoy is ready atleast once i.e. server state is LIVE and workers
+	// have started, they will not go back in the life time of Envoy process.
+	// They will only change at hot restart or health check fails. Since Istio
+	// does not use both of them, it is safe to cache this value. Since the
+	// actual readiness probe goes via Envoy it ensures that Envoy is actively
+	// serving traffic and we can rely on that.
+	if p.atleastOnceReady {
+		return nil
+	}
+
+	err := checkEnvoyStats(p.LocalHostAddr, p.AdminPort)
+	if err == nil {
+		metrics.RecordStartupTime()
+		p.atleastOnceReady = true
+	}
+	return err
+}
+
+// checkEnvoyStats actually executes the Stats Query on Envoy admin endpoint.
+func checkEnvoyStats(host string, port uint16) error {
+	state, ws, err := util.GetReadinessStats(host, port)
+	if err != nil {
+		return fmt.Errorf("failed to get readiness stats: %v", err)
+	}
+
+	if state != nil && admin.ServerInfo_State(*state) != admin.ServerInfo_LIVE {
+		return fmt.Errorf("server is not live, current state is: %v", admin.ServerInfo_State(*state).String())
+	}
+
+	if !ws {
+		return fmt.Errorf("workers have not yet started")
+	}
+
+	return nil
 }

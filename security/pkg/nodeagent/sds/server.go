@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,239 +15,111 @@
 package sds
 
 import (
-	"fmt"
 	"net"
-	"os"
+	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/security/pkg/nodeagent/cache"
-	"istio.io/istio/security/pkg/nodeagent/plugin"
-	"istio.io/istio/security/pkg/nodeagent/plugin/providers/google/stsclient"
+	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/uds"
 )
 
-const maxStreams = 100000
-
-// Options provides all of the configuration parameters for secret discovery service.
-type Options struct {
-	// EnableWorkloadSDS indicates whether node agent works as SDS server for workload proxies.
-	EnableWorkloadSDS bool
-	// WorkloadUDSPath is the unix domain socket through which SDS server communicates with workload proxies.
-	WorkloadUDSPath string
-
-	// EnableIngressGatewaySDS indicates whether node agent works as ingress gateway agent.
-	EnableIngressGatewaySDS bool
-	// IngressGatewayUDSPath is the unix domain socket through which SDS server communicates with
-	// ingress gateway proxies.
-	IngressGatewayUDSPath string
-
-	// CertFile is the path of Cert File for gRPC server TLS settings.
-	CertFile string
-
-	// KeyFile is the path of Key File for gRPC server TLS settings.
-	KeyFile string
-
-	// CAEndpoint is the CA endpoint to which node agent sends CSR request.
-	CAEndpoint string
-
-	// The CA provider name.
-	CAProviderName string
-
-	// TrustDomain corresponds to the trust root of a system.
-	// https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain
-	TrustDomain string
-
-	// PluginNames is plugins' name for certain authentication provider.
-	PluginNames []string
-
-	// The Vault CA address.
-	VaultAddress string
-
-	// The Vault auth path.
-	VaultAuthPath string
-
-	// The Vault role.
-	VaultRole string
-
-	// The Vault sign CSR path.
-	VaultSignCsrPath string
-
-	// The Vault TLS root certificate.
-	VaultTLSRootCert string
-
-	// AlwaysValidTokenFlag is set to true for if token used is always valid(ex, normal k8s JWT)
-	AlwaysValidTokenFlag bool
-}
+const (
+	maxStreams    = 100000
+	maxRetryTimes = 5
+)
 
 // Server is the gPRC server that exposes SDS through UDS.
 type Server struct {
 	workloadSds *sdsservice
-	gatewaySds  *sdsservice
 
 	grpcWorkloadListener net.Listener
-	grpcGatewayListener  net.Listener
 
 	grpcWorkloadServer *grpc.Server
-	grpcGatewayServer  *grpc.Server
 }
 
 // NewServer creates and starts the Grpc server for SDS.
-func NewServer(options Options, workloadSecretCache, gatewaySecretCache cache.SecretManager) (*Server, error) {
-	s := &Server{
-		workloadSds: newSDSService(workloadSecretCache, false),
-		gatewaySds:  newSDSService(gatewaySecretCache, true),
-	}
-	if options.EnableWorkloadSDS {
-		if err := s.initWorkloadSdsService(&options); err != nil {
-			log.Errorf("Failed to initialize secret discovery service for workload proxies: %v", err)
-			return nil, err
-		}
-		log.Infof("SDS gRPC server start, listen %q \n", options.WorkloadUDSPath)
-	}
-
-	if options.EnableIngressGatewaySDS {
-		if err := s.initGatewaySdsService(&options); err != nil {
-			log.Errorf("Failed to initialize secret discovery service for ingress gateway: %v", err)
-			return nil, err
-		}
-		log.Infof("SDS gRPC server start, listen %q \n", options.IngressGatewayUDSPath)
-	}
-
-	return s, nil
+func NewServer(options *security.Options, workloadSecretCache security.SecretManager) *Server {
+	s := &Server{}
+	s.workloadSds = newSDSService(workloadSecretCache, options)
+	s.initWorkloadSdsService(options)
+	sdsServiceLog.Infof("SDS server for workload certificates started, listening on %q", options.WorkloadUDSPath)
+	return s
 }
 
-// Stop closes the gRPC server.
+func (s *Server) UpdateCallback(resourceName string) {
+	if s.workloadSds == nil {
+		return
+	}
+	s.workloadSds.XdsServer.Push(&model.PushRequest{
+		Full: false,
+		ConfigsUpdated: map[model.ConfigKey]struct{}{
+			{Kind: gvk.Secret, Name: resourceName}: {},
+		},
+		Reason: []model.TriggerReason{model.SecretTrigger},
+	})
+}
+
+// Stop closes the gRPC server and debug server.
 func (s *Server) Stop() {
 	if s == nil {
 		return
 	}
 
-	if s.grpcWorkloadListener != nil {
-		s.grpcWorkloadListener.Close()
-	}
-	if s.grpcGatewayListener != nil {
-		s.grpcGatewayListener.Close()
-	}
-
 	if s.grpcWorkloadServer != nil {
 		s.grpcWorkloadServer.Stop()
 	}
-	if s.grpcGatewayServer != nil {
-		s.grpcGatewayServer.Stop()
+	if s.grpcWorkloadListener != nil {
+		s.grpcWorkloadListener.Close()
+	}
+	if s.workloadSds != nil {
+		s.workloadSds.Close()
 	}
 }
 
-// NewPlugins returns a slice of default Plugins.
-func NewPlugins(in []string) []plugin.Plugin {
-	var availablePlugins = map[string]plugin.Plugin{
-		plugin.GoogleTokenExchange: stsclient.NewPlugin(),
-	}
-	var plugins []plugin.Plugin
-	for _, pl := range in {
-		if p, exist := availablePlugins[pl]; exist {
-			plugins = append(plugins, p)
-		}
-	}
-	return plugins
-}
-
-func (s *Server) initWorkloadSdsService(options *Options) error { //nolint: unparam
-	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions(options)...)
+func (s *Server) initWorkloadSdsService(options *security.Options) {
+	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions()...)
 	s.workloadSds.register(s.grpcWorkloadServer)
 
 	var err error
-	s.grpcWorkloadListener, err = setUpUds(options.WorkloadUDSPath)
+	s.grpcWorkloadListener, err = uds.NewListener(options.WorkloadUDSPath)
 	if err != nil {
-		log.Errorf("SDS grpc server for workload proxies failed to start: %v", err)
+		sdsServiceLog.Errorf("Failed to set up UDS path: %v", err)
 	}
 
 	go func() {
-		for {
-			// Retry if Serve() fails
-			log.Info("Start SDS grpc server")
-			if err = s.grpcWorkloadServer.Serve(s.grpcWorkloadListener); err != nil {
-				log.Errorf("SDS grpc server for workload proxies failed to start: %v", err)
+		sdsServiceLog.Info("Start SDS grpc server")
+		waitTime := time.Second
+
+		for i := 0; i < maxRetryTimes; i++ {
+			serverOk := true
+			setUpUdsOK := true
+			if s.grpcWorkloadListener == nil {
+				if s.grpcWorkloadListener, err = uds.NewListener(options.WorkloadUDSPath); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to set up UDS: %v", err)
+					setUpUdsOK = false
+				}
 			}
-			s.grpcWorkloadListener, err = setUpUds(options.WorkloadUDSPath)
-			if err != nil {
-				log.Errorf("SDS grpc server for workload proxies failed to set up UDS: %v", err)
+			if s.grpcWorkloadListener != nil {
+				if err = s.grpcWorkloadServer.Serve(s.grpcWorkloadListener); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to start: %v", err)
+					serverOk = false
+				}
 			}
+			if serverOk && setUpUdsOK {
+				break
+			}
+			time.Sleep(waitTime)
+			waitTime *= 2
 		}
 	}()
-
-	return nil
 }
 
-func (s *Server) initGatewaySdsService(options *Options) error {
-	s.grpcGatewayServer = grpc.NewServer(s.grpcServerOptions(options)...)
-	s.gatewaySds.register(s.grpcGatewayServer)
-
-	var err error
-	s.grpcGatewayListener, err = setUpUds(options.IngressGatewayUDSPath)
-	if err != nil {
-		log.Errorf("SDS grpc server for ingress gateway proxy failed to start: %v", err)
-		return fmt.Errorf("SDS grpc server for ingress gateway proxy failed to start: %v", err)
-	}
-
-	go func() {
-		for {
-			// Retry if Serve() fails
-			log.Info("Start SDS grpc server for ingress gateway proxy")
-			if err = s.grpcGatewayServer.Serve(s.grpcGatewayListener); err != nil {
-				log.Errorf("SDS grpc server for ingress gateway proxy failed to start: %v", err)
-			}
-			s.grpcGatewayListener, err = setUpUds(options.IngressGatewayUDSPath)
-			if err != nil {
-				log.Errorf("SDS grpc server for ingress gateway proxy failed to set up UDS: %v", err)
-			}
-		}
-	}()
-
-	return nil
-}
-
-func setUpUds(udsPath string) (net.Listener, error) {
-	// Remove unix socket before use.
-	if err := os.Remove(udsPath); err != nil && !os.IsNotExist(err) {
-		// Anything other than "file not found" is an error.
-		log.Errorf("Failed to remove unix://%s: %v", udsPath, err)
-		return nil, fmt.Errorf("failed to remove unix://%s", udsPath)
-	}
-
-	var err error
-	udsListener, err := net.Listen("unix", udsPath)
-	if err != nil {
-		log.Errorf("Failed to listen on unix socket %q: %v", udsPath, err)
-		return nil, err
-	}
-
-	// Update SDS UDS file permission so that istio-proxy has permission to access it.
-	if _, err := os.Stat(udsPath); err != nil {
-		log.Errorf("SDS uds file %q doesn't exist", udsPath)
-		return nil, fmt.Errorf("sds uds file %q doesn't exist", udsPath)
-	}
-	if err := os.Chmod(udsPath, 0666); err != nil {
-		log.Errorf("Failed to update %q permission", udsPath)
-		return nil, fmt.Errorf("failed to update %q permission", udsPath)
-	}
-
-	return udsListener, nil
-}
-
-func (s *Server) grpcServerOptions(options *Options) []grpc.ServerOption {
+func (s *Server) grpcServerOptions() []grpc.ServerOption {
 	grpcOptions := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(uint32(maxStreams)),
-	}
-
-	if options.CertFile != "" && options.KeyFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(options.CertFile, options.KeyFile)
-		if err != nil {
-			log.Errorf("Failed to load TLS keys: %s", err)
-			return nil
-		}
-		grpcOptions = append(grpcOptions, grpc.Creds(creds))
 	}
 
 	return grpcOptions

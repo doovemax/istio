@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,115 +15,175 @@
 package secretcontroller
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	pkgtest "istio.io/istio/pkg/test"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-const secretName string = "testSecretName"
-const secretNameSpace string = "istio-system"
+const secretNamespace string = "istio-system"
 
-var testCreateControllerCalled bool
-var testDeleteControllerCalled bool
-
-func testCreateController(k8sInterface kubernetes.Interface, clusterID string) error {
-	testCreateControllerCalled = true
-	return nil
+type clusterCredential struct {
+	clusterID  string
+	kubeconfig []byte
 }
 
-func testDeleteController(clusterID string) error {
-	testDeleteControllerCalled = true
-	return nil
-}
-
-func createMultiClusterSecret(k8s *fake.Clientset) error {
-	data := map[string][]byte{}
-	secret := v1.Secret{
+func makeSecret(secret string, clusterConfigs ...clusterCredential) *v1.Secret {
+	s := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: secretNameSpace,
+			Name:      secret,
+			Namespace: secretNamespace,
 			Labels: map[string]string{
-				"istio/multiCluster": "true",
+				MultiClusterSecretLabel: "true",
 			},
 		},
 		Data: map[string][]byte{},
 	}
 
-	data["testRemoteCluster"] = []byte("Test")
-	secret.Data = data
-	_, err := k8s.CoreV1().Secrets(secretNameSpace).Create(&secret)
-	return err
+	for _, config := range clusterConfigs {
+		s.Data[config.clusterID] = config.kubeconfig
+	}
+	return s
 }
 
-func deleteMultiClusterSecret(k8s *fake.Clientset) error {
-	var immediate int64
+var (
+	mu      sync.Mutex
+	added   cluster.ID
+	updated cluster.ID
+	deleted cluster.ID
+)
 
-	return k8s.CoreV1().Secrets(secretNameSpace).Delete(
-		secretName, &metav1.DeleteOptions{GracePeriodSeconds: &immediate})
+func addCallback(id cluster.ID, _ *Cluster) error {
+	mu.Lock()
+	defer mu.Unlock()
+	added = id
+	return nil
 }
 
-func mockLoadKubeConfig(kubeconfig []byte) (*clientcmdapi.Config, error) {
-	return &clientcmdapi.Config{}, nil
+func updateCallback(id cluster.ID, _ *Cluster) error {
+	mu.Lock()
+	defer mu.Unlock()
+	updated = id
+	return nil
 }
 
-func verifyControllerDeleted(t *testing.T, timeoutName string) {
-	pkgtest.NewEventualOpts(10*time.Millisecond, 5*time.Second).Eventually(t, timeoutName, func() bool {
-		return testDeleteControllerCalled == true
-	})
+func deleteCallback(id cluster.ID) error {
+	mu.Lock()
+	defer mu.Unlock()
+	deleted = id
+	return nil
 }
 
-func verifyControllerCreated(t *testing.T, timeoutName string) {
-	pkgtest.NewEventualOpts(10*time.Millisecond, 5*time.Second).Eventually(t, timeoutName, func() bool {
-		return testCreateControllerCalled == true
-	})
+func resetCallbackData() {
+	added = ""
+	updated = ""
+	deleted = ""
 }
 
 func Test_SecretController(t *testing.T) {
-	LoadKubeConfig = mockLoadKubeConfig
+	BuildClientsFromConfig = func(kubeConfig []byte) (kube.Client, error) {
+		return kube.NewFakeClient(), nil
+	}
+	features.RemoteClusterTimeout = 10 * time.Nanosecond
+	clientset := kube.NewFakeClient()
 
-	clientset := fake.NewSimpleClientset()
+	var (
+		secret0                        = makeSecret("s0", clusterCredential{"c0", []byte("kubeconfig0-0")})
+		secret0UpdateKubeconfigChanged = makeSecret("s0", clusterCredential{"c0", []byte("kubeconfig0-1")})
+		secret0UpdateKubeconfigSame    = makeSecret("s0", clusterCredential{"c0", []byte("kubeconfig0-1")})
+		secret0AddCluster              = makeSecret("s0", clusterCredential{"c0", []byte("kubeconfig0-1")}, clusterCredential{"c0-1", []byte("kubeconfig0-2")})
+		secret0DeleteCluster           = secret0UpdateKubeconfigChanged // "c0-1" cluster deleted
+		secret1                        = makeSecret("s1", clusterCredential{"c1", []byte("kubeconfig1-0")})
+	)
+	secret0UpdateKubeconfigSame.Annotations = map[string]string{"foo": "bar"}
+
+	steps := []struct {
+		// only set one of these per step. The others should be nil.
+		add    *v1.Secret
+		update *v1.Secret
+		delete *v1.Secret
+
+		// only set one of these per step. The others should be empty.
+		wantAdded   cluster.ID
+		wantUpdated cluster.ID
+		wantDeleted cluster.ID
+	}{
+		{add: secret0, wantAdded: "c0"},                             // 0
+		{update: secret0UpdateKubeconfigChanged, wantUpdated: "c0"}, // 1
+		{update: secret0UpdateKubeconfigSame},                       // 2
+		{update: secret0AddCluster, wantAdded: "c0-1"},              // 3
+		{update: secret0DeleteCluster, wantDeleted: "c0-1"},         // 4
+		{add: secret1, wantAdded: "c1"},                             // 5
+		{delete: secret0, wantDeleted: "c0"},                        // 6
+		{delete: secret1, wantDeleted: "c1"},                        // 7
+	}
 
 	// Start the secret controller and sleep to allow secret process to start.
-	err := StartSecretController(
-		clientset, testCreateController, testDeleteController, secretNameSpace)
-	if err != nil {
-		t.Fatalf("Could not start secret controller: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond)
+	stopCh := make(chan struct{})
+	t.Cleanup(func() {
+		close(stopCh)
+	})
+	c := StartSecretController(clientset, addCallback, updateCallback, deleteCallback, secretNamespace, time.Microsecond, stopCh)
+	t.Run("sync timeout", func(t *testing.T) {
+		retry.UntilOrFail(t, c.HasSynced, retry.Timeout(2*time.Second))
+	})
+	kube.WaitForCacheSyncInterval(stopCh, time.Microsecond, c.informer.HasSynced)
+	clientset.RunAndWait(stopCh)
 
-	// Create the multicluster secret.
-	err = createMultiClusterSecret(clientset)
-	if err != nil {
-		t.Fatalf("Unexpected error on secret create: %v", err)
-	}
+	for i, step := range steps {
+		resetCallbackData()
 
-	verifyControllerCreated(t, "Create remote secret controller")
+		t.Run(fmt.Sprintf("[%v]", i), func(t *testing.T) {
+			g := NewWithT(t)
 
-	if testDeleteControllerCalled != false {
-		t.Fatalf("Test failed on create secret, delete callback function called")
-	}
+			switch {
+			case step.add != nil:
+				_, err := clientset.CoreV1().Secrets(secretNamespace).Create(context.TODO(), step.add, metav1.CreateOptions{})
+				g.Expect(err).Should(BeNil())
+			case step.update != nil:
+				_, err := clientset.CoreV1().Secrets(secretNamespace).Update(context.TODO(), step.update, metav1.UpdateOptions{})
+				g.Expect(err).Should(BeNil())
+			case step.delete != nil:
+				g.Expect(clientset.CoreV1().Secrets(secretNamespace).Delete(context.TODO(), step.delete.Name, metav1.DeleteOptions{})).
+					Should(Succeed())
+			}
 
-	// Reset test variables and delete the multicluster secret.
-	testCreateControllerCalled = false
-	testDeleteControllerCalled = false
-
-	err = deleteMultiClusterSecret(clientset)
-	if err != nil {
-		t.Fatalf("Unexpected error on secret delete: %v", err)
-	}
-
-	// Test - Verify that the remote controller has been removed.
-	verifyControllerDeleted(t, "delete remote secret controller")
-
-	// Test
-	if testCreateControllerCalled != false {
-		t.Fatalf("Test failed on delete secret, create callback function called")
+			switch {
+			case step.wantAdded != "":
+				g.Eventually(func() cluster.ID {
+					mu.Lock()
+					defer mu.Unlock()
+					return added
+				}, 10*time.Second).Should(Equal(step.wantAdded))
+			case step.wantUpdated != "":
+				g.Eventually(func() cluster.ID {
+					mu.Lock()
+					defer mu.Unlock()
+					return updated
+				}, 10*time.Second).Should(Equal(step.wantUpdated))
+			case step.wantDeleted != "":
+				g.Eventually(func() cluster.ID {
+					mu.Lock()
+					defer mu.Unlock()
+					return deleted
+				}, 10*time.Second).Should(Equal(step.wantDeleted))
+			default:
+				g.Consistently(func() bool {
+					mu.Lock()
+					defer mu.Unlock()
+					return added == "" && updated == "" && deleted == ""
+				}).Should(Equal(true))
+			}
+		})
 	}
 }

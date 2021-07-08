@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,29 +19,39 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
+	"github.com/golang/protobuf/ptypes/duration"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 
-	"istio.io/istio/pkg/log"
-	caClientInterface "istio.io/istio/security/pkg/nodeagent/caclient/interface"
+	"istio.io/istio/pkg/bootstrap/platform"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/security/pkg/nodeagent/caclient"
 	gcapb "istio.io/istio/security/proto/providers/google"
+	"istio.io/pkg/env"
+	"istio.io/pkg/log"
 )
 
-var usePodDefaultFlag = false
+const hubIDPPrefix = "https://gkehub.googleapis.com/"
 
-const bearerTokenPrefix = "Bearer "
+var (
+	googleCAClientLog = log.RegisterScope("googleca", "Google CA client debugging", 0)
+	envGkeClusterURL  = env.RegisterStringVar("GKE_CLUSTER_URL", "", "The url of GKE cluster").Get()
+)
 
 type googleCAClient struct {
 	caEndpoint string
 	enableTLS  bool
-	client     gcapb.IstioCertificateServiceClient
+	client     gcapb.MeshCertificateServiceClient
+	conn       *grpc.ClientConn
 }
 
 // NewGoogleCAClient create a CA client for Google CA.
-func NewGoogleCAClient(endpoint string, tls bool) (caClientInterface.Client, error) {
+func NewGoogleCAClient(endpoint string, tls bool, provider *caclient.TokenProvider) (security.Client, error) {
 	c := &googleCAClient{
 		caEndpoint: endpoint,
 		enableTLS:  tls,
@@ -58,51 +68,84 @@ func NewGoogleCAClient(endpoint string, tls bool) (caClientInterface.Client, err
 		opts = grpc.WithInsecure()
 	}
 
-	conn, err := grpc.Dial(endpoint, opts)
+	conn, err := grpc.Dial(endpoint,
+		opts,
+		grpc.WithPerRPCCredentials(provider),
+		security.CARetryInterceptor(),
+	)
 	if err != nil {
-		log.Errorf("Failed to connect to endpoint %s: %v", endpoint, err)
+		googleCAClientLog.Errorf("Failed to connect to endpoint %s: %v", endpoint, err)
 		return nil, fmt.Errorf("failed to connect to endpoint %s", endpoint)
 	}
 
-	c.client = gcapb.NewIstioCertificateServiceClient(conn)
+	c.conn = conn
+	c.client = gcapb.NewMeshCertificateServiceClient(conn)
 	return c, nil
 }
 
 // CSR Sign calls Google CA to sign a CSR.
-func (cl *googleCAClient) CSRSign(ctx context.Context, csrPEM []byte, token string,
-	certValidTTLInSec int64) ([]string /*PEM-encoded certificate chain*/, error) {
-	req := &gcapb.IstioCertificateRequest{
-		Csr:              string(csrPEM),
-		ValidityDuration: certValidTTLInSec,
+func (cl *googleCAClient) CSRSign(csrPEM []byte, certValidTTLInSec int64) ([]string, error) {
+	req := &gcapb.MeshCertificateRequest{
+		RequestId: uuid.New().String(),
+		Csr:       string(csrPEM),
+		Validity:  &duration.Duration{Seconds: certValidTTLInSec},
 	}
 
-	// If the token doesn't have "Bearer " prefix, add it.
-	if !strings.HasPrefix(token, bearerTokenPrefix) {
-		token = bearerTokenPrefix + token
+	out := metadata.New(nil)
+	gkeClusterURL := envGkeClusterURL
+	if envGkeClusterURL == "" && platform.IsGCP() {
+		gkeClusterURL = platform.NewGCP().Metadata()[platform.GCPClusterURL]
+	}
+	zone := parseZone(gkeClusterURL)
+	if zone != "" {
+		out["x-goog-request-params"] = []string{fmt.Sprintf("location=locations/%s", zone)}
 	}
 
-	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", token))
+	ctx := metadata.NewOutgoingContext(context.Background(), out)
 	resp, err := cl.client.CreateCertificate(ctx, req)
 	if err != nil {
-		log.Errorf("Failed to create certificate: %v", err)
+		googleCAClientLog.Errorf("Failed to create certificate: %v", err)
+		googleCAClientLog.Debugf("Original request %v, resp %v", req, resp)
 		return nil, err
 	}
 
 	if len(resp.CertChain) <= 1 {
-		log.Errorf("CertChain length is %d, expected more than 1", len(resp.CertChain))
+		googleCAClientLog.Errorf("CertChain length is %d, expected more than 1", len(resp.CertChain))
 		return nil, errors.New("invalid response cert chain")
 	}
+	googleCAClientLog.Infof("Cert created with GoogleCA %s chain length %d", zone, len(resp.CertChain))
 
 	return resp.CertChain, nil
+}
+
+func (cl *googleCAClient) Close() {
+	if cl.conn != nil {
+		cl.conn.Close()
+	}
 }
 
 func (cl *googleCAClient) getTLSDialOption() (grpc.DialOption, error) {
 	// Load the system default root certificates.
 	pool, err := x509.SystemCertPool()
 	if err != nil {
-		log.Errorf("could not get SystemCertPool: %v", err)
+		googleCAClientLog.Errorf("could not get SystemCertPool: %v", err)
 		return nil, errors.New("could not get SystemCertPool")
 	}
 	creds := credentials.NewClientTLSFromCert(pool, "")
 	return grpc.WithTransportCredentials(creds), nil
+}
+
+func parseZone(clusterURL string) string {
+	// for Hub IDNS, the input is https://gkehub.googleapis.com/projects/HUB_PROJECT_ID/locations/global/memberships/MEMBERSHIP_ID which is global
+	if strings.HasPrefix(clusterURL, hubIDPPrefix) {
+		return ""
+	}
+	// input: https://container.googleapis.com/v1/projects/testproj/locations/us-central1-c/clusters/cluster1
+	// output: us-central1-c
+	rgx := regexp.MustCompile(`.*/projects/(.*)/locations/(.*)/clusters/.*`)
+	rs := rgx.FindStringSubmatch(clusterURL)
+	if len(rs) < 3 {
+		return ""
+	}
+	return rs[2]
 }

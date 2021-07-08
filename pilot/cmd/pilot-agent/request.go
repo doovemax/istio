@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 
 	"istio.io/istio/pilot/pkg/request"
 )
+
+var debugRequestPort int32 = 15000
 
 // NB: extra standard output in addition to what's returned from envoy
 // must not be added in this command. Otherwise, it'd break istioctl proxy-config,
@@ -33,7 +36,7 @@ var (
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(c *cobra.Command, args []string) error {
 			command := &request.Command{
-				Address: "127.0.0.1:15000",
+				Address: fmt.Sprintf("localhost:%d", debugRequestPort),
 				Client: &http.Client{
 					Timeout: 60 * time.Second,
 				},
@@ -49,4 +52,6 @@ var (
 
 func init() {
 	rootCmd.AddCommand(requestCmd)
+	requestCmd.PersistentFlags().Int32Var(&debugRequestPort, "debug-port", debugRequestPort,
+		"Set the port to make a local request to. The default points to the Envoy admin API.")
 }

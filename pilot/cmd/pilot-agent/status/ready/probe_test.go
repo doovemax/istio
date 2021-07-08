@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,115 +15,192 @@
 package ready
 
 import (
+	"context"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	. "github.com/onsi/gomega"
+
+	"istio.io/istio/pilot/cmd/pilot-agent/status/testserver"
 )
 
-var probe = Probe{AdminPort: 1234}
+var (
+	liveServerStats = "cluster_manager.cds.update_success: 1\nlistener_manager.lds.update_success: 1\nserver.state: 0\nlistener_manager.workers_started: 1"
+	onlyServerStats = "server.state: 0"
+	initServerStats = "cluster_manager.cds.update_success: 1\nlistener_manager.lds.update_success: 1\nserver.state: 2"
+	noServerStats   = ""
+)
 
 func TestEnvoyStatsCompleteAndSuccessful(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_success: 1\nlistener_manager.lds.update_success: 1"
+	g := NewWithT(t)
 
-	server := createAndStartServer(stats)
+	server := testserver.CreateAndStartServer(liveServerStats)
 	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 
 	err := probe.Check()
 
 	g.Expect(err).NotTo(HaveOccurred())
 }
 
-func TestEnvoyStatsIncompleteCDS(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "listener_manager.lds.update_success: 1"
+func TestEnvoyDraining(t *testing.T) {
+	g := NewWithT(t)
 
-	server := createAndStartServer(stats)
+	server := testserver.CreateAndStartServer(liveServerStats)
 	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port), Context: ctx}
+	cancel()
 
-	err := probe.Check()
+	err := probe.isEnvoyReady()
 
 	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("cds updates: 0"))
 }
 
-func TestEnvoyStatsIncompleteLDS(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_success: 1"
-
-	server := createAndStartServer(stats)
-	defer server.Close()
-
-	err := probe.Check()
-
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("lds updates: 0"))
-}
-
-func TestEnvoyStatsCompleteAndRejectedCDS(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_rejected: 1\nlistener_manager.lds.update_success: 1"
-
-	server := createAndStartServer(stats)
-	defer server.Close()
-
-	err := probe.Check()
-
-	g.Expect(err).NotTo(HaveOccurred())
-}
-
-func TestEnvoyStatsCompleteAndRejectedLDS(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_success: 1\nlistener_manager.lds.update_rejected: 1"
-
-	server := createAndStartServer(stats)
-	defer server.Close()
-
-	err := probe.Check()
-
-	g.Expect(err).NotTo(HaveOccurred())
-}
-
-func TestEnvoyCheckFailsIfStatsUnparsableNoSeparator(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_success; 1\nlistener_manager.lds.update_success: 1"
-
-	server := createAndStartServer(stats)
-	defer server.Close()
-
-	err := probe.Check()
-
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("missing separator"))
-}
-
-func TestEnvoyCheckFailsIfStatsUnparsableNoNumber(t *testing.T) {
-	g := NewGomegaWithT(t)
-	stats := "cluster_manager.cds.update_success: a\nlistener_manager.lds.update_success: 1"
-
-	server := createAndStartServer(stats)
-	defer server.Close()
-
-	err := probe.Check()
-
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("failed parsing Envoy stat"))
-}
-
-func createAndStartServer(statsToReturn string) *httptest.Server {
-	// Start a local HTTP server
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// Send response to be tested
-		rw.Write([]byte(statsToReturn))
-	}))
-	l, err := net.Listen("tcp", "127.0.0.1:1234")
-	if err != nil {
-		panic("Could not create listener for test: " + err.Error())
+func TestEnvoyStats(t *testing.T) {
+	prefix := "config not received from Pilot (is Pilot running?): "
+	cases := []struct {
+		name   string
+		stats  string
+		result string
+	}{
+		{
+			"only lds",
+			"listener_manager.lds.update_success: 1",
+			prefix + "cds updates: 0 successful, 0 rejected; lds updates: 1 successful, 0 rejected",
+		},
+		{
+			"only cds",
+			"cluster_manager.cds.update_success: 1",
+			prefix + "cds updates: 1 successful, 0 rejected; lds updates: 0 successful, 0 rejected",
+		},
+		{
+			"reject CDS",
+			`cluster_manager.cds.update_rejected: 1
+listener_manager.lds.update_success: 1`,
+			prefix + "cds updates: 0 successful, 1 rejected; lds updates: 1 successful, 0 rejected",
+		},
+		{
+			"workers not started",
+			`
+cluster_manager.cds.update_success: 1
+listener_manager.lds.update_success: 1
+listener_manager.workers_started: 0
+server.state: 0`,
+			"workers have not yet started",
+		},
+		{
+			"full",
+			`
+cluster_manager.cds.update_success: 1
+listener_manager.lds.update_success: 1
+listener_manager.workers_started: 1
+server.state: 0`,
+			"",
+		},
 	}
-	server.Listener = l
-	server.Start()
-	return server
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := testserver.CreateAndStartServer(tt.stats)
+			defer server.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+			probe.Context = ctx
+			err := probe.Check()
+
+			// Expect no error
+			if tt.result == "" {
+				if err != nil {
+					t.Fatalf("Expected no error, got: %v", err)
+				}
+				return
+			}
+			// Expect error
+			if err.Error() != tt.result {
+				t.Fatalf("Expected: \n'%v', got: \n'%v'", tt.result, err.Error())
+			}
+		})
+	}
+}
+
+func TestEnvoyInitializing(t *testing.T) {
+	g := NewWithT(t)
+
+	server := testserver.CreateAndStartServer(initServerStats)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
+	err := probe.Check()
+
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestEnvoyNoClusterManagerStats(t *testing.T) {
+	g := NewWithT(t)
+
+	server := testserver.CreateAndStartServer(onlyServerStats)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
+	err := probe.Check()
+
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestEnvoyNoServerStats(t *testing.T) {
+	g := NewWithT(t)
+
+	server := testserver.CreateAndStartServer(noServerStats)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
+	err := probe.Check()
+
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestEnvoyReadinessCache(t *testing.T) {
+	g := NewWithT(t)
+
+	server := testserver.CreateAndStartServer(noServerStats)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
+	err := probe.Check()
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(probe.atleastOnceReady).Should(BeFalse())
+	err = probe.Check()
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(probe.atleastOnceReady).Should(BeFalse())
+	server.Close()
+
+	server = testserver.CreateAndStartServer(liveServerStats)
+	probe.AdminPort = uint16(server.Listener.Addr().(*net.TCPAddr).Port)
+	err = probe.Check()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(probe.atleastOnceReady).Should(BeTrue())
+	server.Close()
+
+	server = testserver.CreateAndStartServer(noServerStats)
+	probe.AdminPort = uint16(server.Listener.Addr().(*net.TCPAddr).Port)
+	err = probe.Check()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(probe.atleastOnceReady).Should(BeTrue())
+	server.Close()
+
+	err = probe.Check()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(probe.atleastOnceReady).Should(BeTrue())
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,20 +15,37 @@
 package snapshot
 
 import (
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/types"
+
 	mcp "istio.io/api/mcp/v1alpha1"
-	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/mcp/sink"
 	"istio.io/istio/pkg/mcp/source"
+	"istio.io/pkg/log"
 )
 
 var scope = log.RegisterScope("mcp", "mcp debugging", 0)
 
 // Snapshot provides an immutable view of versioned resources.
 type Snapshot interface {
+	Collections() []string
 	Resources(collection string) []*mcp.Resource
 	Version(collection string) string
+}
+
+// Info is used for configz
+type Info struct {
+	// Collection of mcp resource
+	Collection string
+	// Version of the resource
+	Version string
+	// Names of the resource entries.
+	Names []string
+	// Synced of this collection, including peerAddr and synced status
+	Synced map[string]bool
 }
 
 // Cache is a snapshot-based cache that maintains a single versioned
@@ -58,56 +75,31 @@ func New(groupIndex GroupIndexFn) *Cache {
 	}
 }
 
-var _ source.Watcher = &Cache{}
-
 type responseWatch struct {
 	request      *source.Request
 	pushResponse source.PushResponseFunc
 }
 
-// StatusInfo records watch status information of a remote node.
+// StatusInfo records watch status information of a group.
 type StatusInfo struct {
 	mu                   sync.RWMutex
-	node                 *mcp.SinkNode
 	lastWatchRequestTime time.Time // informational
 	watches              map[int64]*responseWatch
-}
-
-// Watches returns the number of open watches.
-func (si *StatusInfo) Watches() int {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return len(si.watches)
-}
-
-// LastWatchRequestTime returns the time the most recent watch request
-// was received.
-func (si *StatusInfo) LastWatchRequestTime() time.Time {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return si.lastWatchRequestTime
+	// the synced structure is {Collection: {peerAddress: synced|nosynced}}.
+	synced map[string]map[string]bool
 }
 
 // Watch returns a watch for an MCP request.
-func (c *Cache) Watch(request *source.Request, pushResponse source.PushResponseFunc) source.CancelWatchFunc { // nolint: lll
+func (c *Cache) Watch(
+	request *source.Request,
+	pushResponse source.PushResponseFunc,
+	peerAddr string) source.CancelWatchFunc {
 	group := c.groupIndex(request.Collection, request.SinkNode)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	info, ok := c.status[group]
-	if !ok {
-		info = &StatusInfo{
-			node:    request.SinkNode,
-			watches: make(map[int64]*responseWatch),
-		}
-		c.status[group] = info
-	}
-
-	// update last responseWatch request time
-	info.mu.Lock()
-	info.lastWatchRequestTime = time.Now()
-	info.mu.Unlock()
+	info := c.fillStatus(group, request, peerAddr)
 
 	collection := request.Collection
 
@@ -130,6 +122,7 @@ func (c *Cache) Watch(request *source.Request, pushResponse source.PushResponseF
 			pushResponse(response)
 			return nil
 		}
+		info.synced[request.Collection][peerAddr] = true
 	}
 
 	// Otherwise, open a watch if no snapshot was available or the requested version is up-to-date.
@@ -146,13 +139,60 @@ func (c *Cache) Watch(request *source.Request, pushResponse source.PushResponseF
 	cancel := func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if info, ok := c.status[group]; ok {
-			info.mu.Lock()
-			delete(info.watches, watchID)
-			info.mu.Unlock()
+		if s, ok := c.status[group]; ok {
+			s.mu.Lock()
+			delete(s.watches, watchID)
+			s.mu.Unlock()
 		}
 	}
 	return cancel
+}
+
+func (c *Cache) fillStatus(group string, request *source.Request, peerAddr string) *StatusInfo {
+	info, ok := c.status[group]
+	if !ok {
+		info = &StatusInfo{
+			watches: make(map[int64]*responseWatch),
+			synced:  make(map[string]map[string]bool),
+		}
+		peerStatus := make(map[string]bool)
+		peerStatus[peerAddr] = false
+		info.synced[request.Collection] = peerStatus
+		c.status[group] = info
+	} else {
+		collectionExists := false
+		peerExists := false
+		for collection, synced := range info.synced {
+			if collection == request.Collection {
+				collectionExists = true
+				for addr := range synced {
+					if addr == peerAddr {
+						peerExists = true
+						break
+					}
+				}
+			}
+			if collectionExists && peerExists {
+				break
+			}
+		}
+		if !collectionExists {
+			// initiate the synced map
+			peerStatus := make(map[string]bool)
+			peerStatus[peerAddr] = false
+			info.synced[request.Collection] = peerStatus
+		}
+		if !peerExists {
+			info.synced[request.Collection][peerAddr] = false
+		}
+	}
+
+	// update last responseWatch request time
+	info.mu.Lock()
+	info.lastWatchRequestTime = time.Now()
+	info.mu.Unlock()
+
+	return info
 }
 
 // SetSnapshot updates a snapshot for a group.
@@ -224,6 +264,48 @@ func (c *Cache) Status(group string) *StatusInfo {
 	defer c.mu.RUnlock()
 	if info, ok := c.status[group]; ok {
 		return info
+	}
+	return nil
+}
+
+// GetGroups returns all groups of snapshots that the server layer is serving.
+func (c *Cache) GetGroups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	groups := make([]string, 0, len(c.snapshots))
+
+	for t := range c.snapshots {
+		groups = append(groups, t)
+	}
+	sort.Strings(groups)
+
+	return groups
+}
+
+// GetResource returns the mcp resource detailed information for the specified group
+func (c *Cache) GetResource(group string, collection string, resourceName string) *sink.Object {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// if the group or collection is empty, return empty
+	if group == "" || collection == "" {
+		return nil
+	}
+
+	if snapshot, ok := c.snapshots[group]; ok {
+		for _, resource := range snapshot.Resources(collection) {
+			if resource.Metadata.Name == resourceName {
+				var dynamicAny types.DynamicAny
+				if err := types.UnmarshalAny(resource.Body, &dynamicAny); err == nil {
+					return &sink.Object{
+						TypeURL:  resource.Body.TypeUrl,
+						Metadata: resource.Metadata,
+						Body:     dynamicAny.Message,
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
