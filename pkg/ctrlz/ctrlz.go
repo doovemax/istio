@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-//go:generate $GOPATH/src/istio.io/istio/bin/go-bindata.sh --nocompress --nometadata --pkg ctrlz -o assets.gen.go assets/...
 
 // Package ctrlz implements Istio's introspection facility. When components
 // integrate with ControlZ, they automatically gain an IP port which allows operators
@@ -27,18 +25,19 @@
 package ctrlz
 
 import (
+	"fmt"
 	"html/template"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/mux"
 
-	"sync"
-
-	"fmt"
-	"time"
-
+	"istio.io/istio/pkg/ctrlz/assets"
 	"istio.io/istio/pkg/ctrlz/fw"
 	"istio.io/istio/pkg/ctrlz/topics"
 	"istio.io/istio/pkg/log"
@@ -51,22 +50,24 @@ var coreTopics = []fw.Topic{
 	topics.ProcTopic(),
 	topics.ArgsTopic(),
 	topics.VersionTopic(),
-	topics.MetricsTopic(),
+	topics.SignalsTopic(),
 }
 
-var allTopics []fw.Topic
-var topicMutex sync.Mutex
-var listeningTestProbe func()
+var (
+	allTopics          []fw.Topic
+	topicMutex         sync.Mutex
+	listeningTestProbe func()
+)
 
 // Server represents a running ControlZ instance.
 type Server struct {
+	listener   net.Listener
 	shutdown   sync.WaitGroup
 	httpServer http.Server
-	listener   net.Listener
 }
 
 func augmentLayout(layout *template.Template, page string) *template.Template {
-	return template.Must(layout.Parse(string(MustAsset(page))))
+	return assets.ParseTemplate(layout, page)
 }
 
 func registerTopic(router *mux.Router, layout *template.Template, t fw.Topic) {
@@ -101,11 +102,10 @@ type topic struct {
 }
 
 func getTopics() []topic {
-	var topics []topic
-
 	topicMutex.Lock()
 	defer topicMutex.Unlock()
 
+	topics := make([]topic, 0, len(allTopics))
 	for _, t := range allTopics {
 		topics = append(topics, topic{Name: t.Title(), URL: "/" + t.Prefix() + "z/"})
 	}
@@ -113,36 +113,17 @@ func getTopics() []topic {
 	return topics
 }
 
-// RegisterTopic registers a new Control-Z topic for the current process.
-func RegisterTopic(t fw.Topic) {
-	topicMutex.Lock()
-	defer topicMutex.Unlock()
-
-	allTopics = append(allTopics, t)
+func normalize(input string) string {
+	return strings.Replace(input, "/", "-", -1)
 }
 
 // Run starts up the ControlZ listeners.
 //
-// ControlZ uses the set of standard core topics, the
-// supplied custom topics, as well as any topics registered
-// via the RegisterTopic function.
+// ControlZ uses the set of standard core topics.
 func Run(o *Options, customTopics []fw.Topic) (*Server, error) {
-	if o.Port == 0 {
-		// disabled
-		s := &Server{}
-		return s, nil
-	}
-
 	topicMutex.Lock()
-
-	for _, t := range coreTopics {
-		allTopics = append(allTopics, t)
-	}
-
-	for _, t := range customTopics {
-		allTopics = append(allTopics, t)
-	}
-
+	allTopics = append(allTopics, coreTopics...)
+	allTopics = append(allTopics, customTopics...)
 	topicMutex.Unlock()
 
 	exec, _ := os.Executable()
@@ -150,21 +131,29 @@ func Run(o *Options, customTopics []fw.Topic) (*Server, error) {
 
 	funcs := template.FuncMap{
 		"getTopics": getTopics,
+		"normalize": normalize,
 	}
 
-	baseLayout := template.Must(template.New("base").Parse(string(MustAsset("assets/templates/layouts/base.html"))))
+	baseLayout := assets.ParseTemplate(template.New("base"), "templates/layouts/base.html")
 	baseLayout = baseLayout.Funcs(funcs)
 	baseLayout = template.Must(baseLayout.Parse("{{ define \"instance\" }}" + instance + "{{ end }}"))
-	_ = augmentLayout(baseLayout, "assets/templates/modules/header.html")
-	_ = augmentLayout(baseLayout, "assets/templates/modules/sidebar.html")
-	_ = augmentLayout(baseLayout, "assets/templates/modules/last-refresh.html")
-	mainLayout := augmentLayout(template.Must(baseLayout.Clone()), "assets/templates/layouts/main.html")
+	_ = augmentLayout(baseLayout, "templates/modules/header.html")
+	_ = augmentLayout(baseLayout, "templates/modules/sidebar.html")
+	_ = augmentLayout(baseLayout, "templates/modules/last-refresh.html")
+	mainLayout := augmentLayout(template.Must(baseLayout.Clone()), "templates/layouts/main.html")
 
 	router := mux.NewRouter()
 	for _, t := range allTopics {
 		registerTopic(router, mainLayout, t)
 	}
 
+	if o.EnablePprof && o.Address == "localhost" {
+		router.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		router.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		router.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		router.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		router.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
+	}
 	registerHome(router, mainLayout)
 
 	addr := o.Address
@@ -172,20 +161,22 @@ func Run(o *Options, customTopics []fw.Topic) (*Server, error) {
 		addr = ""
 	}
 
-	s := &Server{
-		httpServer: http.Server{
-			ReadTimeout:    10 * time.Second,
-			WriteTimeout:   10 * time.Second,
-			MaxHeaderBytes: 1 << 20,
-			Addr:           fmt.Sprintf("%s:%d", addr, o.Port),
-			Handler:        router,
-		},
-	}
-
-	var err error
-	if s.listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", addr, o.Port)); err != nil {
+	// Canonicalize the address and resolve a dynamic port if necessary
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", addr, o.Port))
+	if err != nil {
 		log.Errorf("Unable to start ControlZ: %v", err)
 		return nil, err
+	}
+
+	s := &Server{
+		listener: listener,
+		httpServer: http.Server{
+			Addr:           listener.Addr().(*net.TCPAddr).String(),
+			ReadTimeout:    10 * time.Second,
+			WriteTimeout:   time.Minute, // High timeout to allow profiles to run
+			MaxHeaderBytes: 1 << 20,
+			Handler:        router,
+		},
 	}
 
 	s.shutdown.Add(1)
@@ -195,14 +186,12 @@ func Run(o *Options, customTopics []fw.Topic) (*Server, error) {
 }
 
 func (s *Server) listen() {
-	log.Infof("ControlZ available at %s", s.listener.Addr().String())
-
+	log.Infof("ControlZ available at %s", s.httpServer.Addr)
 	if listeningTestProbe != nil {
-		listeningTestProbe()
+		go listeningTestProbe()
 	}
-
-	_ = s.httpServer.Serve(s.listener)
-	log.Infof("ControlZ terminated")
+	err := s.httpServer.Serve(s.listener)
+	log.Infof("ControlZ terminated: %v", err)
 	s.shutdown.Done()
 }
 
@@ -211,8 +200,16 @@ func (s *Server) listen() {
 // Close is not normally used by programs that expose ControlZ, it is primarily intended to be
 // used by tests.
 func (s *Server) Close() {
+	log.Info("Closing ControlZ")
+
 	if s.listener != nil {
-		_ = s.listener.Close()
+		if err := s.listener.Close(); err != nil {
+			log.Warnf("Error closing ControlZ: %v", err)
+		}
 		s.shutdown.Wait()
 	}
+}
+
+func (s *Server) Address() string {
+	return s.httpServer.Addr
 }

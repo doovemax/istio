@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,16 @@
 package topics
 
 import (
-	"html/template"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 
 	"istio.io/istio/pkg/ctrlz/fw"
+	"istio.io/istio/pkg/ctrlz/topics/assets"
 )
 
-type envTopic struct {
-}
+type envTopic struct{}
 
 // EnvTopic returns a ControlZ topic that allows visualization of process environment variables.
 func EnvTopic() fw.Topic {
@@ -51,9 +50,7 @@ func getVars() []envVar {
 
 	result := []envVar{}
 	for _, v := range env {
-		var eq = strings.Index(v, "=")
-		var name = v[:eq]
-		var value = v[eq+1:]
+		name, value, _ := strings.Cut(v, "=")
 		result = append(result, envVar{Name: name, Value: value})
 	}
 
@@ -61,7 +58,7 @@ func getVars() []envVar {
 }
 
 func (envTopic) Activate(context fw.TopicContext) {
-	tmpl := template.Must(context.Layout().Parse(string(MustAsset("assets/templates/env.html"))))
+	tmpl := assets.ParseTemplate(context.Layout(), "templates/env.html")
 
 	_ = context.HTMLRouter().StrictSlash(true).NewRoute().Path("/").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		fw.RenderHTML(w, tmpl, getVars())

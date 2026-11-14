@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// NewFileWatcherFunc returns a functions which creates a new file
+// NewFileWatcherFunc returns a function which creates a new file
 // watcher. This may be used to provide test hooks for using the
 // FakeWatcher implementation below.
 type NewFileWatcherFunc func() FileWatcher
@@ -78,7 +78,7 @@ func NewFakeWatcher(changedFunc func(path string, added bool)) (NewFileWatcherFu
 func (w *FakeWatcher) Add(path string) error {
 	w.Lock()
 
-	// w.events and w.errors are always updated togeather. We only check
+	// w.events and w.errors are always updated together. We only check
 	// the first to determine existence.
 	if _, ok := w.events[path]; ok {
 		w.Unlock()

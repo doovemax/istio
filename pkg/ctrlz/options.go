@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,13 +25,19 @@ type Options struct {
 
 	// The IP address to listen on for ctrlz.
 	Address string
+
+	// If true, pprof will be enabled
+	EnablePprof bool
 }
+
+// DefaultControlZPort is the default port for the ControlZ server
+const DefaultControlZPort = 9876
 
 // DefaultOptions returns a new set of options, initialized to the defaults
 func DefaultOptions() *Options {
 	return &Options{
-		Port:    9876,
-		Address: "127.0.0.1",
+		Port:    DefaultControlZPort,
+		Address: "localhost",
 	}
 }
 

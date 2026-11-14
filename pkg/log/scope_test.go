@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,76 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
+	"time"
 
 	"go.uber.org/zap/zapcore"
+	"k8s.io/klog/v2"
 )
 
+func runTest(t *testing.T, f func()) []string {
+	lines, err := captureStdout(func() {
+		Configure(DefaultOptions())
+		f()
+		_ = Sync()
+	})
+	if err != nil {
+		t.Fatalf("Got error '%v', expected success", err)
+	}
+	if lines[len(lines)-1] == "" {
+		return lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func TestKlog(t *testing.T) {
+	cases := []struct {
+		log      func()
+		expected string
+	}{
+		{
+			func() { klog.Error("foo") },
+			"error\tklog\tfoo$",
+		},
+		{
+			func() { klog.Error("foo") },
+			"foo$",
+		},
+		{
+			func() { klog.Errorf("fmt %v", "item") },
+			"fmt item$",
+		},
+		{
+			func() { klog.Errorf("fmt %v", "item") },
+			"fmt item$",
+		},
+		{
+			func() { klog.ErrorS(errors.New("my error"), "info") },
+			"error\tklog\tmy error: info",
+		},
+		{
+			func() { klog.Info("a", "b") },
+			"info\tklog\tab",
+		},
+		{
+			func() { klog.InfoS("msg", "key", 1) },
+			"info\tklog\tmsg\tkey=1",
+		},
+		{
+			func() { klog.ErrorS(errors.New("my error"), "info", "key", 1) },
+			"error\tklog\tmy error: info\tkey=1",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.expected, func(t *testing.T) {
+			lines := runTest(t, tt.log)
+			mustMatchLength(t, 1, lines)
+			mustRegexMatchString(t, lines[0], tt.expected)
+		})
+	}
+}
+
 func TestBasicScopes(t *testing.T) {
-	s := RegisterScope("testScope", "z", 0)
+	s := RegisterScope("testScope", "z")
 
 	cases := []struct {
 		f          func()
@@ -46,10 +110,6 @@ func TestBasicScopes(t *testing.T) {
 			f:   func() { s.Debugf("%s", "Hello") },
 			pat: timePattern + "\tdebug\ttestScope\tHello",
 		},
-		{
-			f:   func() { s.Debuga("Hello") },
-			pat: timePattern + "\tdebug\ttestScope\tHello",
-		},
 
 		{
 			f:   func() { s.Info("Hello") },
@@ -61,10 +121,6 @@ func TestBasicScopes(t *testing.T) {
 		},
 		{
 			f:   func() { s.Infof("%s", "Hello") },
-			pat: timePattern + "\tinfo\ttestScope\tHello",
-		},
-		{
-			f:   func() { s.Infoa("Hello") },
 			pat: timePattern + "\tinfo\ttestScope\tHello",
 		},
 
@@ -80,10 +136,6 @@ func TestBasicScopes(t *testing.T) {
 			f:   func() { s.Warnf("%s", "Hello") },
 			pat: timePattern + "\twarn\ttestScope\tHello",
 		},
-		{
-			f:   func() { s.Warna("Hello") },
-			pat: timePattern + "\twarn\ttestScope\tHello",
-		},
 
 		{
 			f:   func() { s.Error("Hello") },
@@ -97,10 +149,6 @@ func TestBasicScopes(t *testing.T) {
 			f:   func() { s.Errorf("%s", "Hello") },
 			pat: timePattern + "\terror\ttestScope\tHello",
 		},
-		{
-			f:   func() { s.Errora("Hello") },
-			pat: timePattern + "\terror\ttestScope\tHello",
-		},
 
 		{
 			f:        func() { s.Fatal("Hello") },
@@ -108,17 +156,12 @@ func TestBasicScopes(t *testing.T) {
 			wantExit: true,
 		},
 		{
-			f:        func() { s.Fatalf("Hello") },
+			f:        func() { s.Fatal("Hello") },
 			pat:      timePattern + "\tfatal\ttestScope\tHello",
 			wantExit: true,
 		},
 		{
 			f:        func() { s.Fatalf("%s", "Hello") },
-			pat:      timePattern + "\tfatal\ttestScope\tHello",
-			wantExit: true,
-		},
-		{
-			f:        func() { s.Fatala("Hello") },
 			pat:      timePattern + "\tfatal\ttestScope\tHello",
 			wantExit: true,
 		},
@@ -180,13 +223,16 @@ func TestBasicScopes(t *testing.T) {
 			lines, err := captureStdout(func() {
 				o := testOptions()
 				o.JSONEncoding = c.json
-				o.testonlyExit = func() {
-					exitCalled = true
-				}
 
 				if err := Configure(o); err != nil {
 					t.Errorf("Got err '%v', expecting success", err)
 				}
+
+				pt := funcs.Load().(patchTable)
+				pt.exitProcess = func(_ int) {
+					exitCalled = true
+				}
+				funcs.Store(pt)
 
 				s.SetOutputLevel(DebugLevel)
 				s.SetStackTraceLevel(c.stackLevel)
@@ -209,16 +255,71 @@ func TestBasicScopes(t *testing.T) {
 			}
 
 			if match, _ := regexp.MatchString(c.pat, lines[0]); !match {
-				t.Errorf("Got '%v', expected a match with '%v'", lines[0], c.pat)
+				t.Errorf("Got '%v',\nexpected a match with '%v'", lines[0], c.pat)
 			}
 		})
+	}
+}
+
+func TestScopeWithLabel(t *testing.T) {
+	const name = "TestScope"
+	const desc = "Desc"
+	s := RegisterScope(name, desc)
+	s.SetOutputLevel(DebugLevel)
+
+	lines, err := captureStdout(func() {
+		Configure(DefaultOptions())
+		funcs.Store(funcs.Load().(patchTable))
+		s2 := s.WithLabels("foo", "bar").WithLabels("baz", 123, "qux", 0.123, "dur", time.Millisecond*101).WithLabels("foo", "override")
+		s2.Debug("Hello")
+		// s should be unmodified.
+		s.Debug("Hello")
+
+		_ = Sync()
+	})
+	if err != nil {
+		t.Errorf("Got error '%v', expected success", err)
+	}
+
+	mustRegexMatchString(t, lines[0], `Hello	foo=override baz=123 qux=0.123 dur=101ms`)
+	mustRegexMatchString(t, lines[1], "Hello$")
+}
+
+func TestScopeJSON(t *testing.T) {
+	const name = "TestScope"
+	const desc = "Desc"
+	s := RegisterScope(name, desc)
+	s.SetOutputLevel(DebugLevel)
+
+	lines, err := captureStdout(func() {
+		o := DefaultOptions()
+		o.JSONEncoding = true
+		Configure(o)
+		funcs.Store(funcs.Load().(patchTable))
+		s.WithLabels("foo", "bar", "baz", 123, "dur", time.Millisecond*101).Debug("Hello")
+
+		_ = Sync()
+	})
+	if err != nil {
+		t.Errorf("Got error '%v', expected success", err)
+	}
+
+	mustRegexMatchString(t, lines[0], `{.*"msg":"Hello","foo":"bar","baz":123,"dur":"101ms"}`)
+}
+
+func mustRegexMatchString(t *testing.T, got, want string) {
+	t.Helper()
+	match, _ := regexp.MatchString(want, got)
+
+	if !match {
+		t.Fatalf("Got '%v', expected a match with '%v'", got, want)
 	}
 }
 
 func TestScopeEnabled(t *testing.T) {
 	const name = "TestEnabled"
 	const desc = "Desc"
-	s := RegisterScope(name, desc, 0)
+	s := RegisterScope(name, desc)
 
 	if n := s.Name(); n != name {
 		t.Errorf("Got %s, expected %s", n, name)
@@ -276,8 +377,8 @@ func TestScopeEnabled(t *testing.T) {
 }
 
 func TestMultipleScopesWithSameName(t *testing.T) {
-	z1 := RegisterScope("zzzz", "z", 0)
-	z2 := RegisterScope("zzzz", "z", 0)
+	z1 := RegisterScope("zzzz", "z")
+	z2 := RegisterScope("zzzz", "z")
 
 	if z1 != z2 {
 		t.Error("Expecting the same scope objects, got different ones")
@@ -289,7 +390,7 @@ func TestFind(t *testing.T) {
 		t.Error("Found scope, but expected it wouldn't exist")
 	}
 
-	_ = RegisterScope("TestFind", "", 0)
+	_ = RegisterScope("TestFind", "")
 
 	if z := FindScope("TestFind"); z == nil {
 		t.Error("Did not find scope, expected to find it")
@@ -297,17 +398,34 @@ func TestFind(t *testing.T) {
 }
 
 func TestBadNames(t *testing.T) {
-	if s := RegisterScope("a:b", "", 0); s != nil {
-		t.Error("Expecting to get nil")
+	badNames := []string{
+		"a:b",
+		"a,b",
+		"a.b",
+
+		":ab",
+		",ab",
+		".ab",
+
+		"ab:",
+		"ab,",
+		"ab.",
 	}
 
-	if s := RegisterScope("a,b", "", 0); s != nil {
-		t.Error("Expecting to get nil")
+	for _, name := range badNames {
+		tryBadName(t, name)
 	}
+}
 
-	if s := RegisterScope("a.b", "", 0); s != nil {
-		t.Error("Expecting to get nil")
-	}
+func tryBadName(t *testing.T, name string) {
+	defer func() {
+		if r := recover(); r != nil {
+			return
+		}
+		t.Errorf("Expecting to panic when using bad scope name %s, but didn't", name)
+	}()
+
+	_ = RegisterScope(name, "A poorly named scope")
 }
 
 func TestBadWriter(t *testing.T) {
@@ -316,11 +434,72 @@ func TestBadWriter(t *testing.T) {
 		t.Errorf("Got err '%v', expecting success", err)
 	}
 
-	writeFn.Store(func(zapcore.Entry, []zapcore.Field) error {
+	pt := funcs.Load().(patchTable)
+	pt.write = func(zapcore.Entry, []zapcore.Field) error {
 		return errors.New("bad")
-	})
+	}
+	funcs.Store(pt)
 
 	// for now, we just make sure this doesn't crash. To be totally correct, we'd need to capture stderr and
 	// inspect it, but it's just not worth it
 	defaultScope.Error("TestBadWriter")
+}
+
+// Regression test for a race condition
+func TestUpdateScope(t *testing.T) {
+	o := testOptions()
+	if err := Configure(o); err != nil {
+		t.Errorf("Got err '%v', expecting success", err)
+	}
+
+	go func() {
+		for range 100 {
+			defaultScope.SetOutputLevel(DebugLevel)
+		}
+	}()
+	go func() {
+		for range 100 {
+			defaultScope.WithLabels("foo", "bar")
+		}
+	}()
+}
+
+func BenchmarkLog(b *testing.B) {
+	runOpts := func(name string, opts func(*Options), f func()) {
+		b.Run(name, func(b *testing.B) {
+			o := testOptions()
+			o.OutputPaths = []string{"/dev/null"}
+			opts(o)
+			if err := Configure(o); err != nil {
+				b.Fatalf("Got err '%v', expecting success", err)
+			}
+			for n := 0; n < b.N; n++ {
+				f()
+			}
+		})
+	}
+	run := func(name string, f func()) {
+		runOpts(name, func(options *Options) {}, f)
+	}
+	run("default", func() {
+		Info("some message")
+	})
+	run("formatted", func() {
+		Infof("some %s", "message")
+	})
+	scope := WithLabels("some", "value", "foo", 123)
+	run("precreated labels", func() {
+		scope.Infof("some %s", "message")
+	})
+	run("labels", func() {
+		WithLabels("some", "value", "foo", 123).Infof("some %s", "message")
+	})
+	run("precreated and dynamic labels", func() {
+		scope.WithLabels("fruit", "apply").Infof("some %s", "message")
+	})
+	runOpts("json", func(options *Options) {
+		options.JSONEncoding = true
+	}, func() {
+		scope.Infof("some %s", "message")
+	})
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,157 +15,175 @@
 package model
 
 import (
-	rbacproto "istio.io/api/rbac/v1alpha1"
-	istiolog "istio.io/istio/pkg/log"
+	"k8s.io/apimachinery/pkg/types"
+
+	authpb "istio.io/api/security/v1beta1"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
 )
 
-const (
-	// DefaultRbacConfigName is the name of the mesh global RbacConfig name. Only RbacConfig with this
-	// name will be considered.
-	DefaultRbacConfigName = "default"
-)
-
-var (
-	rbacLog = istiolog.RegisterScope("rbac", "rbac debugging", 0)
-)
-
-// RolesAndBindings stores the the ServiceRole and ServiceRoleBinding in the same namespace.
-type RolesAndBindings struct {
-	// ServiceRoles in the same namespace.
-	Roles []Config
-
-	// Maps from ServiceRole name to its associated ServiceRoleBindings.
-	RoleNameToBindings map[string][]*rbacproto.ServiceRoleBinding
+type AuthorizationPolicy struct {
+	Name        string                      `json:"name"`
+	Namespace   string                      `json:"namespace"`
+	Annotations map[string]string           `json:"annotations"`
+	Spec        *authpb.AuthorizationPolicy `json:"spec"`
 }
 
-// AuthorizationPolicies stores all authorization policies (i.e. ServiceRole, ServiceRoleBinding and
-// RbacConfig) according to its namespace.
-type AuthorizationPolicies struct {
-	// Maps from namespace to ServiceRole and ServiceRoleBindings.
-	NamespaceToPolicies map[string]*RolesAndBindings
-
-	// The mesh global RbacConfig.
-	RbacConfig *rbacproto.RbacConfig
+func (ap *AuthorizationPolicy) NamespacedName() types.NamespacedName {
+	return types.NamespacedName{Name: ap.Name, Namespace: ap.Namespace}
 }
 
-func (policy *AuthorizationPolicies) addServiceRole(role *Config) {
-	if role == nil || role.Spec.(*rbacproto.ServiceRole) == nil {
+func (policy *AuthorizationPolicies) indexHTTPRoutePolicies(authz AuthorizationPolicy) {
+	if !features.EnableGatewayAPIHTTPRouteAuth {
 		return
 	}
-	if policy.NamespaceToPolicies == nil {
-		policy.NamespaceToPolicies = map[string]*RolesAndBindings{}
-	}
-	if policy.NamespaceToPolicies[role.Namespace] == nil {
-		policy.NamespaceToPolicies[role.Namespace] = &RolesAndBindings{
-			Roles:              []Config{},
-			RoleNameToBindings: map[string][]*rbacproto.ServiceRoleBinding{},
-		}
-	}
-	rolesAndBindings := policy.NamespaceToPolicies[role.Namespace]
-	rolesAndBindings.Roles = append(rolesAndBindings.Roles, *role)
-}
-
-func (policy *AuthorizationPolicies) addServiceRoleBinding(binding *Config) {
-	if binding == nil || binding.Spec.(*rbacproto.ServiceRoleBinding) == nil {
+	action := authz.Spec.GetAction()
+	isALLOW := action == authpb.AuthorizationPolicy_ALLOW
+	isDENY := action == authpb.AuthorizationPolicy_DENY
+	if !isALLOW && !isDENY {
+		// Not a valid action for HTTPRoute targetRefs currently.
 		return
 	}
-	name := binding.Spec.(*rbacproto.ServiceRoleBinding).RoleRef.Name
-	if name == "" {
-		rbacLog.Errorf("ignored invalid binding %s in %s with empty RoleRef.Name",
-			binding.Name, binding.Namespace)
-		return
-	}
-	if policy.NamespaceToPolicies == nil {
-		policy.NamespaceToPolicies = map[string]*RolesAndBindings{}
-	}
-	if policy.NamespaceToPolicies[binding.Namespace] == nil {
-		policy.NamespaceToPolicies[binding.Namespace] = &RolesAndBindings{
-			Roles:              []Config{},
-			RoleNameToBindings: map[string][]*rbacproto.ServiceRoleBinding{},
-		}
-	}
-	rolesAndBindings := policy.NamespaceToPolicies[binding.Namespace]
-	if rolesAndBindings.RoleNameToBindings[name] == nil {
-		rolesAndBindings.RoleNameToBindings[name] = []*rbacproto.ServiceRoleBinding{}
-	}
-	rolesAndBindings.RoleNameToBindings[name] = append(
-		rolesAndBindings.RoleNameToBindings[name], binding.Spec.(*rbacproto.ServiceRoleBinding))
-}
 
-// AddConfig adds a config of type ServiceRole or ServiceRoleBinding to AuthorizationPolicies.
-func (policy *AuthorizationPolicies) AddConfig(cfgs ...*Config) {
-	for _, cfg := range cfgs {
-		if cfg == nil {
+	seenRefs := sets.New[types.NamespacedName]()
+	for _, ref := range GetTargetRefs(authz.Spec) {
+		if !matchesGroupKind(ref, gvk.HTTPRoute) {
 			continue
 		}
-		switch cfg.Spec.(type) {
-		case *rbacproto.ServiceRole:
-			policy.addServiceRole(cfg)
-		case *rbacproto.ServiceRoleBinding:
-			policy.addServiceRoleBinding(cfg)
+
+		if ref.GetName() == "" {
+			continue
+		}
+		// Cross namespace references are not supported.
+		if ref.GetNamespace() != "" && ref.GetNamespace() != authz.Namespace {
+			continue
+		}
+
+		// Must target HTTPRoute in own namespace.
+		k := types.NamespacedName{Name: ref.GetName(), Namespace: authz.Namespace}
+		if !seenRefs.InsertContains(k) {
+			result := policy.httpRoutePolicies[k]
+			if isALLOW {
+				result.Allow = append(result.Allow, authz)
+			}
+			if isDENY {
+				result.Deny = append(result.Deny, authz)
+			}
+			policy.httpRoutePolicies[k] = result
 		}
 	}
 }
 
-// RolesForNamespace returns the ServiceRole configs in the given namespace. This function always
-// return a non nil slice.
-func (policy *AuthorizationPolicies) RolesForNamespace(ns string) []Config {
-	if policy == nil || policy.NamespaceToPolicies == nil {
-		return []Config{}
-	}
+// AuthorizationPolicies organizes AuthorizationPolicy by namespace.
+type AuthorizationPolicies struct {
+	// Maps from namespace to the Authorization policies.
+	NamespaceToPolicies map[string][]AuthorizationPolicy `json:"namespace_to_policies"`
 
-	rolesAndBindings := policy.NamespaceToPolicies[ns]
-	if rolesAndBindings == nil || rolesAndBindings.Roles == nil {
-		return []Config{}
-	}
-	return rolesAndBindings.Roles
+	// Index for HTTPRoute targeted policy.
+	httpRoutePolicies map[types.NamespacedName]AuthorizationPoliciesResult
+
+	// The name of the root namespace. Policy in the root namespace applies to workloads in all namespaces.
+	RootNamespace string `json:"root_namespace"`
 }
 
-// RoleToBindingsForNamespace returns the mapping from ServiceRole name to its associated ServiceRoleBindings.
-// This function always return a non nil map.
-func (policy *AuthorizationPolicies) RoleToBindingsForNamespace(ns string) map[string][]*rbacproto.ServiceRoleBinding {
-	if policy == nil || policy.NamespaceToPolicies == nil {
-		return map[string][]*rbacproto.ServiceRoleBinding{}
-	}
-
-	rolesAndBindings := policy.NamespaceToPolicies[ns]
-	if rolesAndBindings == nil || rolesAndBindings.RoleNameToBindings == nil {
-		return map[string][]*rbacproto.ServiceRoleBinding{}
-	}
-	return rolesAndBindings.RoleNameToBindings
-}
-
-// NewAuthzPolicies returns the AuthorizationPolicies constructed from raw authorization policies by
-// storing policies into different namespaces.
-func NewAuthzPolicies(env *Environment) (*AuthorizationPolicies, error) {
-	// Get the ClusterRbacConfig first, if not found then fallback to get the RbacConfig.
-	rbacConfig := env.IstioConfigStore.ClusterRbacConfig()
-	if rbacConfig == nil {
-		rbacConfig = env.IstioConfigStore.RbacConfig()
-		if rbacConfig == nil {
-			return nil, nil
-		}
-	}
+// GetAuthorizationPolicies returns the AuthorizationPolicies for the given environment.
+func GetAuthorizationPolicies(env *Environment) *AuthorizationPolicies {
 	policy := &AuthorizationPolicies{
-		NamespaceToPolicies: map[string]*RolesAndBindings{},
-		RbacConfig:          rbacConfig.Spec.(*rbacproto.RbacConfig),
+		NamespaceToPolicies: map[string][]AuthorizationPolicy{},
+		httpRoutePolicies:   map[types.NamespacedName]AuthorizationPoliciesResult{},
+		RootNamespace:       env.Mesh().GetRootNamespace(),
 	}
 
-	roles, err := env.List(ServiceRole.Type, NamespaceAll)
-	if err != nil {
-		return nil, err
-	}
-	for _, role := range roles {
-		policy.AddConfig(&role)
+	policies := env.List(gvk.AuthorizationPolicy, NamespaceAll)
+	sortConfigByCreationTime(policies)
+
+	policyCount := make(map[string]int)
+	for _, config := range policies {
+		policyCount[config.Namespace]++
 	}
 
-	bindings, err := env.List(ServiceRoleBinding.Type, NamespaceAll)
-	if err != nil {
-		return nil, err
-	}
-	for _, binding := range bindings {
-		policy.AddConfig(&binding)
+	for _, config := range policies {
+		authzConfig := AuthorizationPolicy{
+			Name:        config.Name,
+			Namespace:   config.Namespace,
+			Annotations: config.Annotations,
+			Spec:        config.Spec.(*authpb.AuthorizationPolicy),
+		}
+		if _, ok := policy.NamespaceToPolicies[config.Namespace]; !ok {
+			policy.NamespaceToPolicies[config.Namespace] = make([]AuthorizationPolicy, 0, policyCount[config.Namespace])
+		}
+		policy.NamespaceToPolicies[config.Namespace] = append(policy.NamespaceToPolicies[config.Namespace], authzConfig)
+		policy.indexHTTPRoutePolicies(authzConfig)
 	}
 
-	return policy, nil
+	return policy
+}
+
+type AuthorizationPoliciesResult struct {
+	Custom []AuthorizationPolicy
+	Deny   []AuthorizationPolicy
+	Allow  []AuthorizationPolicy
+	Audit  []AuthorizationPolicy
+}
+
+// ListAuthorizationPoliciesForHTTPRoute returns authorization policies that explicitly target
+// the given HTTPRoute via targetRef. Limited to ALLOW and DENY actions currently.
+func (policy *AuthorizationPolicies) ListAuthorizationPoliciesForHTTPRoute(route types.NamespacedName) AuthorizationPoliciesResult {
+	if policy == nil {
+		return AuthorizationPoliciesResult{}
+	}
+	return policy.httpRoutePolicies[route]
+}
+
+// ListAuthorizationPolicies returns authorization policies applied to the workload in the given namespace.
+func (policy *AuthorizationPolicies) ListAuthorizationPolicies(selectionOpts WorkloadPolicyMatcher) AuthorizationPoliciesResult {
+	configs := AuthorizationPoliciesResult{}
+	if policy == nil {
+		return configs
+	}
+
+	if len(selectionOpts.Services) > 1 {
+		// Currently, listing multiple services is unnecessary.
+		// To simplify, this function allows at most one service.
+		// The restriction can be lifted if future needs arise.
+		panic("ListAuthorizationPolicies expects at most 1 service in WorkloadPolicyMatcher")
+	}
+
+	lookupInNamespaces := []string{policy.RootNamespace, selectionOpts.WorkloadNamespace}
+	for _, svc := range selectionOpts.Services {
+		lookupInNamespaces = append(lookupInNamespaces, svc.Namespace)
+	}
+
+	for _, ns := range slices.FilterDuplicates(lookupInNamespaces) {
+		for _, config := range policy.NamespaceToPolicies[ns] {
+			spec := config.Spec
+
+			if selectionOpts.ShouldAttachPolicy(gvk.AuthorizationPolicy, config.NamespacedName(), spec) {
+				configs = updateAuthorizationPoliciesResult(configs, config)
+			}
+		}
+	}
+
+	return configs
+}
+
+func updateAuthorizationPoliciesResult(configs AuthorizationPoliciesResult, config AuthorizationPolicy) AuthorizationPoliciesResult {
+	log.Debugf("applying authorization policy %s.%s",
+		config.Namespace, config.Name)
+	switch config.Spec.GetAction() {
+	case authpb.AuthorizationPolicy_ALLOW:
+		configs.Allow = append(configs.Allow, config)
+	case authpb.AuthorizationPolicy_DENY:
+		configs.Deny = append(configs.Deny, config)
+	case authpb.AuthorizationPolicy_AUDIT:
+		configs.Audit = append(configs.Audit, config)
+	case authpb.AuthorizationPolicy_CUSTOM:
+		configs.Custom = append(configs.Custom, config)
+	default:
+		log.Errorf("ignored authorization policy %s.%s with unsupported action: %s",
+			config.Namespace, config.Name, config.Spec.GetAction())
+	}
+	return configs
 }

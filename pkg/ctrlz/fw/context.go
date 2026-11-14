@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 
 // Topic is used to describe a single major ControlZ functional area.
 type Topic interface {
-
 	// Title returns the title for the area, which will be used in the sidenav and window title.
 	Title() string
 

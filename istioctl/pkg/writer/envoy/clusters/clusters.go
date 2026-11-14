@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,11 +23,12 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/util/clusters"
-	protio "istio.io/istio/istioctl/pkg/util/proto"
+	"istio.io/istio/istioctl/pkg/util/proto"
 )
 
 // EndpointFilter is used to pass filter information into route based config writer print functions
@@ -46,10 +47,11 @@ type ConfigWriter struct {
 
 // EndpointCluster is used to store the endpoint and cluster
 type EndpointCluster struct {
-	address string
-	port    int
-	cluster string
-	status  core.HealthStatus
+	address            string
+	port               int
+	cluster            string
+	status             core.HealthStatus
+	failedOutlierCheck bool
 }
 
 // Prime loads the clusters output into the writer ready for printing
@@ -63,20 +65,41 @@ func (c *ConfigWriter) Prime(b []byte) error {
 	return nil
 }
 
-func retrieveEndpointAddress(host *adminapi.HostStatus) string {
-	return host.Address.GetSocketAddress().Address
+func retrieveEndpointAddress(host *admin.HostStatus) string {
+	addr := host.Address.GetSocketAddress()
+	if addr != nil {
+		return addr.Address
+	}
+	if pipe := host.Address.GetPipe(); pipe != nil {
+		return "unix://" + pipe.Path
+	}
+	if internal := host.Address.GetEnvoyInternalAddress(); internal != nil {
+		switch an := internal.GetAddressNameSpecifier().(type) {
+		case *core.EnvoyInternalAddress_ServerListenerName:
+			return fmt.Sprintf("envoy://%s/%s", an.ServerListenerName, internal.EndpointId)
+		}
+	}
+	return "unknown"
 }
 
-func retrieveEndpointPort(l *adminapi.HostStatus) uint32 {
-	return l.Address.GetSocketAddress().GetPortValue()
+func retrieveEndpointPort(l *admin.HostStatus) uint32 {
+	addr := l.Address.GetSocketAddress()
+	if addr != nil {
+		return addr.GetPortValue()
+	}
+	return 0
 }
 
-func retrieveEndpointStatus(l *adminapi.HostStatus) core.HealthStatus {
+func retrieveEndpointStatus(l *admin.HostStatus) core.HealthStatus {
 	return l.HealthStatus.GetEdsHealthStatus()
 }
 
+func retrieveFailedOutlierCheck(l *admin.HostStatus) bool {
+	return l.HealthStatus.GetFailedOutlierCheck()
+}
+
 // Verify returns true if the passed host matches the filter fields
-func (e *EndpointFilter) Verify(host *adminapi.HostStatus, cluster string) bool {
+func (e *EndpointFilter) Verify(host *admin.HostStatus, cluster string) bool {
 	if e.Address == "" && e.Port == 0 && e.Cluster == "" && e.Status == "" {
 		return true
 	}
@@ -111,29 +134,34 @@ func (c *ConfigWriter) PrintEndpointsSummary(filter EndpointFilter) error {
 				addr := retrieveEndpointAddress(host)
 				port := retrieveEndpointPort(host)
 				status := retrieveEndpointStatus(host)
-
-				clusterEndpoint = append(clusterEndpoint, EndpointCluster{addr, int(port), cluster.Name, status})
+				outlierCheck := retrieveFailedOutlierCheck(host)
+				clusterEndpoint = append(clusterEndpoint, EndpointCluster{addr, int(port), cluster.Name, status, outlierCheck})
 			}
 		}
 	}
 
 	clusterEndpoint = retrieveSortedEndpointClusterSlice(clusterEndpoint)
-	fmt.Fprintln(w, "ENDPOINT\tSTATUS\tCLUSTER")
+	fmt.Fprintln(w, "ENDPOINT\tSTATUS\tOUTLIER CHECK\tCLUSTER")
 	for _, ce := range clusterEndpoint {
-		endpoint := ce.address + ":" + strconv.Itoa(ce.port)
-		fmt.Fprintf(w, "%v\t%v\t%v\n", endpoint, core.HealthStatus_name[int32(ce.status)], ce.cluster)
+		var endpoint string
+		if ce.port != 0 {
+			endpoint = ce.address + ":" + strconv.Itoa(ce.port)
+		} else {
+			endpoint = ce.address
+		}
+		fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", endpoint, core.HealthStatus_name[int32(ce.status)], printFailedOutlierCheck(ce.failedOutlierCheck), ce.cluster)
 	}
 
 	return w.Flush()
 }
 
 // PrintEndpoints prints the endpoints config to the ConfigWriter stdout
-func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
+func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter, outputFormat string) error {
 	if c.clusters == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
 
-	filteredClusters := protio.MessageSlice{}
+	filteredClusters := proto.MessageSlice{}
 	for _, cluster := range c.clusters.ClusterStatuses {
 		for _, host := range cluster.HostStatuses {
 			if filter.Verify(host, cluster.Name) {
@@ -141,11 +169,15 @@ func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
 				break
 			}
 		}
-
 	}
 	out, err := json.MarshalIndent(filteredClusters, "", "    ")
 	if err != nil {
 		return err
+	}
+	if outputFormat == "yaml" {
+		if out, err = yaml.JSONToYAML(out); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintln(c.Stdout, string(out))
 	return nil
@@ -162,4 +194,11 @@ func retrieveSortedEndpointClusterSlice(ec []EndpointCluster) []EndpointCluster 
 		return ec[i].address < ec[j].address
 	})
 	return ec
+}
+
+func printFailedOutlierCheck(b bool) string {
+	if b {
+		return "FAILED"
+	}
+	return "OK"
 }

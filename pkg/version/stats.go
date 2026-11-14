@@ -1,6 +1,4 @@
-// +build !linux
-
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +14,19 @@
 
 package version
 
+import "istio.io/istio/pkg/monitoring"
+
+var (
+	gitTagKey       = monitoring.CreateLabel("tag")
+	componentTagKey = monitoring.CreateLabel("component")
+	istioBuildTag   = monitoring.NewGauge(
+		"istio_build",
+		"Istio component build info",
+	)
+)
+
 // RecordComponentBuildTag sets the value for a metric that will be used to track component build tags for
 // tracking rollouts, etc.
 func (b BuildInfo) RecordComponentBuildTag(component string) {
-	// only for Linux
+	istioBuildTag.With(gitTagKey.Value(b.GitTag), componentTagKey.Value(component)).Increment()
 }

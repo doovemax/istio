@@ -1,16 +1,23 @@
 [
-	{
-		"_comment": "This file is auto updated by a robot executing `https://github.com/istio/test-infra/blob/master/prow/test-infra-update-deps.sh`.",
-		"name": "PROXY_REPO_SHA",
-		"repoName": "proxy",
-		"file": "",
-		"lastStableSHA": "fc273e117a6ed875c7cb9b3c3251c8d982bc7196"
-	},
-	{
-                "_comment": "",
-                "name": "CNI_REPO_SHA",
-                "repoName": "cni",
-                "file": "",
-                "lastStableSHA": "de2ae6dcce2cd3ac55823b9aa099c2b462a8ba6e"
-        }
+  {
+    "_comment": "",
+    "name": "PROXY_REPO_SHA",
+    "repoName": "proxy",
+    "file": "",
+    "lastStableSHA": "ce62dfb8398e2f37da539273705851adc0259d8a"
+  },
+  {
+    "_comment": "",
+    "name": "ZTUNNEL_REPO_SHA",
+    "repoName": "ztunnel",
+    "file": "",
+    "lastStableSHA": "043ea989bee8fdae7f581038a280ec326635a871"
+  },
+  {
+    "_comment": "",
+    "name": "AGENTGATEWAY_IMAGE",
+    "repoName": "agentgateway",
+    "file": "",
+    "lastStableSHA": "v1.7.0"
+  }
 ]

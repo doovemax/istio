@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package version
 import (
 	"fmt"
 	"runtime"
-	"strings"
 )
 
 // The following fields are populated at build time using -ldflags -X.
@@ -26,21 +25,18 @@ import (
 var (
 	buildVersion     = "unknown"
 	buildGitRevision = "unknown"
-	buildUser        = "unknown"
-	buildHost        = "unknown"
-	buildDockerHub   = "unknown"
 	buildStatus      = "unknown"
 	buildTag         = "unknown"
+	buildHub         = "unknown"
+	buildOS          = "unknown"
+	buildArch        = "unknown"
 )
 
 // BuildInfo describes version information about the binary build.
 type BuildInfo struct {
 	Version       string `json:"version"`
 	GitRevision   string `json:"revision"`
-	User          string `json:"user"`
-	Host          string `json:"host"`
 	GolangVersion string `json:"golang_version"`
-	DockerHub     string `json:"hub"`
 	BuildStatus   string `json:"status"`
 	GitTag        string `json:"tag"`
 }
@@ -48,55 +44,44 @@ type BuildInfo struct {
 // ServerInfo contains the version for a single control plane component
 type ServerInfo struct {
 	Component string
+	Revision  string
 	Info      BuildInfo
 }
 
 // MeshInfo contains the versions for all Istio control plane components
 type MeshInfo []ServerInfo
 
-// NewBuildInfoFromOldString creates a BuildInfo struct based on the output
-// of previous Istio components '-- version' output
-func NewBuildInfoFromOldString(oldOutput string) (BuildInfo, error) {
-	res := BuildInfo{}
+// NodeType decides the responsibility of the proxy serves in the mesh
+type NodeType string
 
-	lines := strings.Split(oldOutput, "\n")
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fields := strings.SplitN(line, ":", 2)
-		if fields != nil {
-			if len(fields) != 2 {
-				return BuildInfo{}, fmt.Errorf("invalid BuildInfo input, field '%s' is not valid", fields[0])
-			}
-			value := strings.TrimSpace(fields[1])
-			switch fields[0] {
-			case "Version":
-				res.Version = value
-			case "GitRevision":
-				res.GitRevision = value
-			case "User":
-				res.User = value
-			case "Hub":
-				res.DockerHub = value
-			case "GolangVersion":
-				res.GolangVersion = value
-			case "BuildStatus":
-				res.BuildStatus = value
-			case "GitTag":
-				res.GitTag = value
-			default:
-				return BuildInfo{}, fmt.Errorf("invalid BuildInfo input, field '%s' is not valid", fields[0])
-			}
-		}
+func ToUserFacingNodeType(t string) NodeType {
+	switch t {
+	case "router":
+		return "gateway"
+	default:
+		return NodeType(t)
 	}
+}
 
-	return res, nil
+// ProxyInfo contains the version for a single data plane component
+type ProxyInfo struct {
+	ID           string
+	IstioVersion string
+	Type         NodeType
+}
+
+// DockerBuildInfo contains and exposes Hub: buildHub, Tag: buildVersion, OS: buildOS, and Arch: buildArch
+type DockerBuildInfo struct {
+	Hub  string
+	Tag  string
+	OS   string
+	Arch string
 }
 
 var (
 	// Info exports the build version information.
-	Info BuildInfo
+	Info       BuildInfo
+	DockerInfo DockerBuildInfo
 )
 
 // String produces a single-line version info
@@ -104,13 +89,10 @@ var (
 // This looks like:
 //
 // ```
-// user@host-<docker hub>-<version>-<git revision>-<build status>
+// u<version>-<git revision>-<build status>
 // ```
 func (b BuildInfo) String() string {
-	return fmt.Sprintf("%v@%v-%v-%v-%v-%v",
-		b.User,
-		b.Host,
-		b.DockerHub,
+	return fmt.Sprintf("%v-%v-%v",
 		b.Version,
 		b.GitRevision,
 		b.BuildStatus)
@@ -118,7 +100,6 @@ func (b BuildInfo) String() string {
 
 // LongForm returns a dump of the Info struct
 // This looks like:
-//
 func (b BuildInfo) LongForm() string {
 	return fmt.Sprintf("%#v", b)
 }
@@ -127,11 +108,15 @@ func init() {
 	Info = BuildInfo{
 		Version:       buildVersion,
 		GitRevision:   buildGitRevision,
-		User:          buildUser,
-		Host:          buildHost,
 		GolangVersion: runtime.Version(),
-		DockerHub:     buildDockerHub,
 		BuildStatus:   buildStatus,
 		GitTag:        buildTag,
+	}
+
+	DockerInfo = DockerBuildInfo{
+		Hub:  buildHub,
+		Tag:  buildVersion,
+		OS:   buildOS,
+		Arch: buildArch,
 	}
 }

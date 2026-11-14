@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,15 @@
 package topics
 
 import (
-	"html/template"
 	"net/http"
 	"os"
 	"runtime"
 
 	"istio.io/istio/pkg/ctrlz/fw"
+	"istio.io/istio/pkg/ctrlz/topics/assets"
 )
 
-type procTopic struct {
-}
+type procTopic struct{}
 
 // ProcTopic returns a ControlZ topic that allows visualization of process state.
 func ProcTopic() fw.Topic {
@@ -42,7 +41,7 @@ func (procTopic) Prefix() string {
 type procInfo struct {
 	Egid       int    `json:"egid"`
 	Euid       int    `json:"euid"`
-	Gid        int    `json:"gid"`
+	GID        int    `json:"gid"`
 	Groups     []int  `json:"groups"`
 	Pid        int    `json:"pid"`
 	Ppid       int    `json:"ppid"`
@@ -58,7 +57,7 @@ func getProcInfo() *procInfo {
 	pi := procInfo{
 		Egid:       os.Getegid(),
 		Euid:       os.Geteuid(),
-		Gid:        os.Getgid(),
+		GID:        os.Getgid(),
 		Pid:        os.Getpid(),
 		Ppid:       os.Getppid(),
 		UID:        os.Getuid(),
@@ -75,7 +74,7 @@ func getProcInfo() *procInfo {
 }
 
 func (procTopic) Activate(context fw.TopicContext) {
-	tmpl := template.Must(context.Layout().Parse(string(MustAsset("assets/templates/proc.html"))))
+	tmpl := assets.ParseTemplate(context.Layout(), "templates/proc.html")
 
 	_ = context.HTMLRouter().StrictSlash(true).NewRoute().Path("/").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		fw.RenderHTML(w, tmpl, getProcInfo())

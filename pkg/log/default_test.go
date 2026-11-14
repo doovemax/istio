@@ -15,17 +15,15 @@
 package log
 
 import (
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func testOptions() *Options {
-	o := DefaultOptions()
-	o.testonlyExit = func() {
-		panic("os.Exit would have been called")
-	}
-	return o
+	return DefaultOptions()
 }
 
 func TestDefault(t *testing.T) {
@@ -49,10 +47,6 @@ func TestDefault(t *testing.T) {
 			f:   func() { Debugf("%s", "Hello") },
 			pat: timePattern + "\tdebug\tHello",
 		},
-		{
-			f:   func() { Debuga("Hello") },
-			pat: timePattern + "\tdebug\tHello",
-		},
 
 		{
 			f:   func() { Info("Hello") },
@@ -67,11 +61,6 @@ func TestDefault(t *testing.T) {
 			pat: timePattern + "\tinfo\tHello",
 		},
 		{
-			f:   func() { Infoa("Hello") },
-			pat: timePattern + "\tinfo\tHello",
-		},
-
-		{
 			f:   func() { Warn("Hello") },
 			pat: timePattern + "\twarn\tHello",
 		},
@@ -81,10 +70,6 @@ func TestDefault(t *testing.T) {
 		},
 		{
 			f:   func() { Warnf("%s", "Hello") },
-			pat: timePattern + "\twarn\tHello",
-		},
-		{
-			f:   func() { Warna("Hello") },
 			pat: timePattern + "\twarn\tHello",
 		},
 
@@ -100,10 +85,6 @@ func TestDefault(t *testing.T) {
 			f:   func() { Errorf("%s", "Hello") },
 			pat: timePattern + "\terror\tHello",
 		},
-		{
-			f:   func() { Errora("Hello") },
-			pat: timePattern + "\terror\tHello",
-		},
 
 		{
 			f:        func() { Fatal("Hello") },
@@ -117,11 +98,6 @@ func TestDefault(t *testing.T) {
 		},
 		{
 			f:        func() { Fatalf("%s", "Hello") },
-			pat:      timePattern + "\tfatal\tHello",
-			wantExit: true,
-		},
-		{
-			f:        func() { Fatala("Hello") },
 			pat:      timePattern + "\tfatal\tHello",
 			wantExit: true,
 		},
@@ -181,13 +157,16 @@ func TestDefault(t *testing.T) {
 			lines, err := captureStdout(func() {
 				o := testOptions()
 				o.JSONEncoding = c.json
-				o.testonlyExit = func() {
-					exitCalled = true
-				}
 
 				if err := Configure(o); err != nil {
 					t.Errorf("Got err '%v', expecting success", err)
 				}
+
+				pt := funcs.Load().(patchTable)
+				pt.exitProcess = func(_ int) {
+					exitCalled = true
+				}
+				funcs.Store(pt)
 
 				defaultScope.SetOutputLevel(DebugLevel)
 				defaultScope.SetStackTraceLevel(c.stackLevel)
@@ -236,9 +215,14 @@ func TestEnabled(t *testing.T) {
 	for i, c := range cases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			o := testOptions()
-			o.SetOutputLevel(DefaultScopeName, c.level)
-			o.testonlyExit = func() {}
+			o.SetDefaultOutputLevel(DefaultScopeName, c.level)
+
 			_ = Configure(o)
+
+			pt := funcs.Load().(patchTable)
+			pt.exitProcess = func(_ int) {
+			}
+			funcs.Store(pt)
 
 			if c.debugEnabled != DebugEnabled() {
 				t.Errorf("Got %v, expecting %v", DebugEnabled(), c.debugEnabled)
@@ -261,4 +245,64 @@ func TestEnabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultWithLabel(t *testing.T) {
+	lines, err := captureStdout(func() {
+		Configure(DefaultOptions())
+		funcs.Store(funcs.Load().(patchTable))
+		WithLabels("foo", "bar").WithLabels("baz", 123, "qux", 0.123).Error("Hello")
+
+		_ = Sync()
+	})
+	if err != nil {
+		t.Errorf("Got error '%v', expected success", err)
+	}
+
+	mustRegexMatchString(t, lines[0], `Hello	foo=bar baz=123 qux=0.123`)
+}
+
+func TestLogWithTime(t *testing.T) {
+	getLogTime := func(t *testing.T, line string) time.Time {
+		type logEntry struct {
+			Time time.Time `json:"time"`
+		}
+		var e logEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("Failed to unmarshal log entry: %v", err)
+		}
+		return e.Time
+	}
+
+	t.Run("specified time", func(t *testing.T) {
+		yesterday := time.Now().Add(-time.Hour * 24).Truncate(time.Microsecond)
+
+		stdoutLines, _ := captureStdout(func() {
+			o := DefaultOptions()
+			o.JSONEncoding = true
+			_ = Configure(o)
+			defaultScope.LogWithTime(InfoLevel, "Hello", yesterday)
+		})
+
+		gotTime := getLogTime(t, stdoutLines[0])
+		if gotTime.UnixNano() != yesterday.UnixNano() {
+			t.Fatalf("Got time %v, expected %v", gotTime, yesterday)
+		}
+	})
+
+	t.Run("empty time", func(t *testing.T) {
+		stdoutLines, _ := captureStdout(func() {
+			o := DefaultOptions()
+			o.JSONEncoding = true
+			_ = Configure(o)
+
+			var ti time.Time
+			defaultScope.LogWithTime(InfoLevel, "Hello", ti)
+		})
+
+		gotTime := getLogTime(t, stdoutLines[0])
+		if gotTime.IsZero() {
+			t.Fatalf("Got %v, expected non-zero", gotTime)
+		}
+	})
 }

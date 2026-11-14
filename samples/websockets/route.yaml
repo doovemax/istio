@@ -1,4 +1,4 @@
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: tornado-gateway
@@ -13,7 +13,7 @@ spec:
     hosts:
     - "*"
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: tornado
@@ -30,4 +30,3 @@ spec:
     - destination:
         host: tornado
       weight: 100
-    websocketUpgrade: true

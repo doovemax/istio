@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,17 +17,17 @@ package topics
 import (
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"net/http"
+	"sort"
 
 	"github.com/gorilla/mux"
 
 	"istio.io/istio/pkg/ctrlz/fw"
+	"istio.io/istio/pkg/ctrlz/topics/assets"
 	"istio.io/istio/pkg/log"
 )
 
-type scopeTopic struct {
-}
+type scopeTopic struct{}
 
 type scopeInfo struct {
 	Name            string `json:"name"`
@@ -77,7 +77,7 @@ func getScopeInfo(s *log.Scope) *scopeInfo {
 }
 
 func (scopeTopic) Activate(context fw.TopicContext) {
-	tmpl := template.Must(context.Layout().Parse(string(MustAsset("assets/templates/scopes.html"))))
+	tmpl := assets.ParseTemplate(context.Layout(), "templates/scopes.html")
 
 	_ = context.HTMLRouter().NewRoute().HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		allScopes := log.Scopes()
@@ -85,6 +85,10 @@ func (scopeTopic) Activate(context fw.TopicContext) {
 		for _, scope := range allScopes {
 			s = append(s, *getScopeInfo(scope))
 		}
+		sort.Slice(s, func(i, j int) bool {
+			return s[i].Name < s[j].Name
+		})
+
 		fw.RenderHTML(w, tmpl, s)
 	})
 
@@ -93,13 +97,16 @@ func (scopeTopic) Activate(context fw.TopicContext) {
 	_ = context.JSONRouter().NewRoute().Methods("PUT").Path("/{scope}").HandlerFunc(putScope)
 }
 
-func getAllScopes(w http.ResponseWriter, req *http.Request) {
+func getAllScopes(w http.ResponseWriter, _ *http.Request) {
 	allScopes := log.Scopes()
 
 	scopeInfos := make([]scopeInfo, 0, len(allScopes))
 	for _, s := range allScopes {
 		scopeInfos = append(scopeInfos, *getScopeInfo(s))
 	}
+	sort.Slice(scopeInfos, func(i, j int) bool {
+		return scopeInfos[i].Name < scopeInfos[j].Name
+	})
 
 	fw.RenderJSON(w, http.StatusOK, scopeInfos)
 }

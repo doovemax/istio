@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,14 @@
 package topics
 
 import (
-	"html/template"
 	"net/http"
 
 	"istio.io/istio/pkg/ctrlz/fw"
+	"istio.io/istio/pkg/ctrlz/topics/assets"
 	"istio.io/istio/pkg/version"
 )
 
-type versionTopic struct {
-}
+type versionTopic struct{}
 
 // VersionTopic returns a ControlZ topic that allows visualization of versioning info.
 func VersionTopic() fw.Topic {
@@ -39,7 +38,7 @@ func (versionTopic) Prefix() string {
 }
 
 func (versionTopic) Activate(context fw.TopicContext) {
-	tmpl := template.Must(context.Layout().Parse(string(MustAsset("assets/templates/version.html"))))
+	tmpl := assets.ParseTemplate(context.Layout(), "templates/version.html")
 
 	_ = context.HTMLRouter().StrictSlash(true).NewRoute().Path("/").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		fw.RenderHTML(w, tmpl, &version.Info)

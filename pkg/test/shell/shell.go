@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -16,42 +16,38 @@ package shell
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
-	"sort"
 	"strings"
+
+	"github.com/google/shlex"
 
 	"istio.io/istio/pkg/log"
 )
 
-var scope = log.RegisterScope("shell", "Shell execution scope", 0)
+var scope = log.RegisterScope("shell", "Shell execution scope")
 
 // Execute the given command.
-func Execute(format string, args ...interface{}) (string, error) {
-	s := fmt.Sprintf(format, args...)
-	// TODO: escape handling
-	parts := strings.Split(s, " ")
+func Execute(combinedOutput bool, args string) (string, error) {
+	parts, err := shlex.Split(args)
+	if err != nil {
+		return "", fmt.Errorf("fail to parse cmd: %q, err: %v", args, err)
+	}
 
+	var p []string
 	for i := 0; i < len(parts); i++ {
-		if parts[i] == "" {
-			parts = append(parts[:i], parts[i+1:]...)
+		if parts[i] != "" {
+			p = append(p, parts[i])
 		}
 	}
 
-	return executeArgs(nil, parts[0], parts[1:]...)
+	var argStrings []string
+	if len(p) > 0 {
+		argStrings = p[1:]
+	}
+	return ExecuteArgs(nil, combinedOutput, parts[0], argStrings...)
 }
 
-// ExecuteEnv executes the given command, with the specified environment value overrides.
-func ExecuteEnv(env map[string]string, format string, args ...interface{}) (string, error) {
-	s := fmt.Sprintf(format, args...)
-	// TODO: escape handling
-	parts := strings.Split(s, " ")
-
-	return executeArgs(toEnvironmentList(env), parts[0], parts[1:]...)
-}
-
-func executeArgs(env []string, name string, args ...string) (string, error) {
-
+func ExecuteArgs(env []string, combinedOutput bool, name string, args ...string) (string, error) {
 	if scope.DebugEnabled() {
 		cmd := strings.Join(args, " ")
 		cmd = name + " " + cmd
@@ -60,7 +56,16 @@ func executeArgs(env []string, name string, args ...string) (string, error) {
 
 	c := exec.Command(name, args...)
 	c.Env = env
-	b, err := c.CombinedOutput()
+
+	var b []byte
+	var err error
+	if combinedOutput {
+		// Combine stderr and stdout in b.
+		b, err = c.CombinedOutput()
+	} else {
+		// Just return stdout in b.
+		b, err = c.Output()
+	}
 
 	if err != nil || !c.ProcessState.Success() {
 		scope.Debugf("Command[%s] => (FAILED) %s", name, string(b))
@@ -69,15 +74,4 @@ func executeArgs(env []string, name string, args ...string) (string, error) {
 	}
 
 	return string(b), err
-}
-
-func toEnvironmentList(m map[string]string) []string {
-	result := os.Environ() // Start with the current environment values and let the caller override.
-
-	for k, v := range m {
-		result = append(result, fmt.Sprintf("%s=%s", k, v))
-	}
-
-	sort.Strings(result)
-	return result
 }

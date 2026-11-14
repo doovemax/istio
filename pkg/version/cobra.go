@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,20 +18,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
-	"github.com/ghodss/yaml"
 	"github.com/spf13/cobra"
+	"sigs.k8s.io/yaml"
 )
 
 // Version holds info for client and control plane versions
 type Version struct {
-	ClientVersion *BuildInfo `json:"clientVersion,omitempty" yaml:"clientVersion,omitempty"`
-	MeshVersion   *MeshInfo  `json:"meshVersion,omitempty" yaml:"meshVersion,omitempty"`
+	ClientVersion    *BuildInfo   `json:"clientVersion,omitempty" yaml:"clientVersion,omitempty"`
+	MeshVersion      *MeshInfo    `json:"meshVersion,omitempty" yaml:"meshVersion,omitempty"`
+	DataPlaneVersion *[]ProxyInfo `json:"dataPlaneVersion,omitempty" yaml:"dataPlaneVersion,omitempty"`
 }
 
-// GetRemoteVersionFunc is the function protoype to be passed to CobraOptions so that it is
+// GetRemoteVersionFunc is the function prototype to be passed to CobraOptions so that it is
 // called when invoking `cmd version`
-type GetRemoteVersionFunc func() (*MeshInfo, error)
+type (
+	GetRemoteVersionFunc func() (*MeshInfo, error)
+	GetProxyVersionFunc  func() (*[]ProxyInfo, error)
+)
 
 // CobraOptions holds options to be passed to `CobraCommandWithOptions`
 type CobraOptions struct {
@@ -39,6 +45,7 @@ type CobraOptions struct {
 	// Istio components. Optional. If not set, the 'version' subcommand will not attempt
 	// to connect to a remote side, and CLI flags such as '--remote' will be hidden.
 	GetRemoteVersion GetRemoteVersionFunc
+	GetProxyVersions GetProxyVersionFunc
 }
 
 // CobraCommand returns a command used to print version information.
@@ -55,7 +62,6 @@ func CobraCommandWithOptions(options CobraOptions) *cobra.Command {
 		remote        bool
 		version       Version
 		remoteVersion *MeshInfo
-		serverErr     error
 	)
 
 	cmd := &cobra.Command{
@@ -69,49 +75,112 @@ func CobraCommandWithOptions(options CobraOptions) *cobra.Command {
 			version.ClientVersion = &Info
 
 			if options.GetRemoteVersion != nil && remote {
-				remoteVersion, serverErr = options.GetRemoteVersion()
+				remoteVersion, _ = options.GetRemoteVersion()
 				version.MeshVersion = remoteVersion
+			}
+			if options.GetProxyVersions != nil && remote {
+				version.DataPlaneVersion, _ = options.GetProxyVersions()
 			}
 
 			switch output {
 			case "":
 				if short {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "client version: %s\n", version.ClientVersion.Version)
 					if remoteVersion != nil {
-						fmt.Fprintf(cmd.OutOrStdout(), "client version: %s\n", version.ClientVersion.Version)
+						remoteVersion = coalesceVersions(remoteVersion)
 						for _, remote := range *remoteVersion {
-							fmt.Fprintf(cmd.OutOrStdout(), "%s version: %s\n", remote.Component, remote.Info.Version)
+							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s version: %s\n", remote.Component, remote.Info.Version)
 						}
-
-					} else {
-						fmt.Fprintf(cmd.OutOrStdout(), "%s\n", version.ClientVersion.Version)
+					}
+					if version.DataPlaneVersion != nil {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "data plane version: %s\n", renderProxyVersions(version.DataPlaneVersion))
 					}
 				} else {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "client version: %s\n", version.ClientVersion.LongForm())
 					if remoteVersion != nil {
-						fmt.Fprintf(cmd.OutOrStdout(), "client version: %s\n", version.ClientVersion.LongForm())
 						for _, remote := range *remoteVersion {
-							fmt.Fprintf(cmd.OutOrStdout(), "%s version: %s\n", remote.Component, remote.Info.LongForm())
+							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s version: %s\n", remote.Component, remote.Info.LongForm())
 						}
-					} else {
-						fmt.Fprintf(cmd.OutOrStdout(), "%s\n", version.ClientVersion.LongForm())
+					}
+					if version.DataPlaneVersion != nil {
+						for _, proxy := range *version.DataPlaneVersion {
+							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "data plane version: %#v\n", proxy)
+						}
 					}
 				}
 			case "yaml":
-				marshalled, _ := yaml.Marshal(&version)
-				fmt.Fprintln(cmd.OutOrStdout(), string(marshalled))
+				if marshaled, err := yaml.Marshal(&version); err == nil {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(marshaled))
+				}
 			case "json":
-				marshalled, _ := json.MarshalIndent(&version, "", "  ")
-				fmt.Fprintln(cmd.OutOrStdout(), string(marshalled))
+				if marshaled, err := json.MarshalIndent(&version, "", "  "); err == nil {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(marshaled))
+				}
 			}
 
-			return serverErr
+			return nil
 		},
 	}
 
-	cmd.Flags().BoolVarP(&short, "short", "s", false, "Displays a short form of the version information")
+	cmd.Flags().BoolVarP(&short, "short", "s", false, "Use --short=false to generate full version information")
 	cmd.Flags().StringVarP(&output, "output", "o", "", "One of 'yaml' or 'json'.")
 	if options.GetRemoteVersion != nil {
-		cmd.Flags().BoolVar(&remote, "remote", false, "Prints remote version information, from the control plane")
+		cmd.Flags().BoolVar(&remote, "remote", false, "Use --remote=false to suppress control plane check")
 	}
 
 	return cmd
+}
+
+func coalesceVersions(remoteVersion *MeshInfo) *MeshInfo {
+	if identicalVersions(*remoteVersion) {
+		return &MeshInfo{
+			ServerInfo{
+				Component: "control plane",
+				Info:      (*remoteVersion)[0].Info,
+			},
+		}
+	}
+
+	return remoteVersion
+}
+
+func identicalVersions(remoteVersion MeshInfo) bool {
+	if len(remoteVersion) == 0 {
+		return false
+	}
+	exemplar := remoteVersion[0].Info
+	for i := 1; i < len(remoteVersion); i++ {
+		candidate := remoteVersion[i].Info
+		// Note that we don't compare GitTag, GitRevision, BuildStatus,
+		// or DockerHub because released Istio versions may use the same version tag
+		// but differ in those fields.
+		if exemplar.Version != candidate.Version {
+			return false
+		}
+	}
+
+	return true
+}
+
+// renderProxyVersions produces human-readable summary of an array of sidecar Istio versions
+func renderProxyVersions(pinfos *[]ProxyInfo) string {
+	if len(*pinfos) == 0 {
+		return "none"
+	}
+
+	versions := make(map[string][]string)
+	for _, pinfo := range *pinfos {
+		ids := versions[pinfo.IstioVersion]
+		versions[pinfo.IstioVersion] = append(ids, pinfo.ID)
+	}
+	sortedVersions := make([]string, 0)
+	for v := range versions {
+		sortedVersions = append(sortedVersions, v)
+	}
+	sort.Strings(sortedVersions)
+	counts := []string{}
+	for _, ver := range sortedVersions {
+		counts = append(counts, fmt.Sprintf("%s (%d proxies)", ver, len(versions[ver])))
+	}
+	return strings.Join(counts, ", ")
 }

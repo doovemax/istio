@@ -1,44 +1,37 @@
-FROM istionightly/base_debug
+# BASE_DISTRIBUTION is used to switch between the old base distribution and distroless base images
+ARG BASE_DISTRIBUTION=debug
+
+# Version is the base image version from the TLD Makefile
+ARG BASE_VERSION=latest
+ARG ISTIO_BASE_REGISTRY=docker.io/istio
+
+# The following section is used as base image if BASE_DISTRIBUTION=debug
+FROM ${ISTIO_BASE_REGISTRY}/base:${BASE_VERSION} AS debug
+
+# The following section is used as base image if BASE_DISTRIBUTION=distroless
+FROM ${ISTIO_BASE_REGISTRY}/iptables:${BASE_VERSION} AS distroless
+
+# This will build the final image based on either debug or distroless from above
+# hadolint ignore=DL3006
+FROM ${BASE_DISTRIBUTION:-debug}
+
+WORKDIR /
+
 ARG proxy_version
-ARG istio_version
-
-ARG ISTIO_API_SHA=unknown
-ARG ENVOY_SHA=unknown
-LABEL istio-api-vcs-ref=$ISTIO_API_SHA \
-    envoy-vcs-ref=$ENVOY_SHA
-
-# Install Envoy.
-ADD envoy /usr/local/bin/envoy
-
-# Environment variables indicating this proxy's version/capabilities as opaque string
-ENV ISTIO_META_ISTIO_PROXY_VERSION "1.1.0"
-# Environment variable indicating the exact proxy sha - for debugging or version-specific configs 
-ENV ISTIO_META_ISTIO_PROXY_SHA $proxy_version
-# Environment variable indicating the exact build, for debugging
-ENV ISTIO_META_ISTIO_VERSION $istio_version
-
-ADD pilot-agent /usr/local/bin/pilot-agent
-
-ADD envoy_pilot.yaml.tmpl /etc/istio/proxy/envoy_pilot.yaml.tmpl
-ADD envoy_policy.yaml.tmpl /etc/istio/proxy/envoy_policy.yaml.tmpl
-ADD envoy_telemetry.yaml.tmpl /etc/istio/proxy/envoy_telemetry.yaml.tmpl
-ADD istio-iptables.sh /usr/local/bin/istio-iptables.sh
+ARG SIDECAR=envoy
 
 # Copy Envoy bootstrap templates used by pilot-agent
-COPY envoy_bootstrap_v2.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
-COPY envoy_bootstrap_drain.json /var/lib/istio/envoy/envoy_bootstrap_drain.json
-COPY gcp_envoy_bootstrap.json /var/lib/istio/envoy/gcp_envoy_bootstrap_tmpl.json
+COPY envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
 
-# Add CA certificates for SSL connections.
-# obtained from debian ca-certs deb using fetch_cacerts.sh
-ADD ca-certificates.tgz /
+# Install Envoy.
+ARG TARGETARCH
+COPY ${TARGETARCH:-amd64}/${SIDECAR} /usr/local/bin/${SIDECAR}
 
-RUN chmod 755 /usr/local/bin/envoy /usr/local/bin/pilot-agent
+# Environment variable indicating the exact proxy sha - for debugging or version-specific configs
+ENV ISTIO_META_ISTIO_PROXY_SHA=$proxy_version
 
-# Sudoers used to allow tcpdump and other debug utilities.
-RUN useradd -m --uid 1337 istio-proxy && \
-    echo "istio-proxy ALL=NOPASSWD: ALL" >> /etc/sudoers && \
-    chown -R istio-proxy /var/lib/istio
+ARG TARGETARCH
+COPY ${TARGETARCH:-amd64}/pilot-agent /usr/local/bin/pilot-agent
 
 # The pilot-agent will bootstrap Envoy.
 ENTRYPOINT ["/usr/local/bin/pilot-agent"]

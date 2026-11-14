@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,14 @@
 package topics
 
 import (
-	"html/template"
 	"net/http"
 	"runtime"
 
 	"istio.io/istio/pkg/ctrlz/fw"
+	"istio.io/istio/pkg/ctrlz/topics/assets"
 )
 
-type memTopic struct {
-}
+type memTopic struct{}
 
 // MemTopic returns a ControlZ topic that allows visualization of process memory usage.
 func MemTopic() fw.Topic {
@@ -40,7 +39,7 @@ func (memTopic) Prefix() string {
 }
 
 func (memTopic) Activate(context fw.TopicContext) {
-	tmpl := template.Must(context.Layout().Parse(string(MustAsset("assets/templates/mem.html"))))
+	tmpl := assets.ParseTemplate(context.Layout(), "templates/mem.html")
 
 	_ = context.HTMLRouter().StrictSlash(true).NewRoute().Path("/").HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ms := &runtime.MemStats{}

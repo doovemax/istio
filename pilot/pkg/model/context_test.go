@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,54 +15,62 @@
 package model_test
 
 import (
-	"fmt"
+	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
+	structpb "google.golang.org/protobuf/types/known/structpb"
+
+	"istio.io/api/label"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pilot/pkg/serviceregistry/mock"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 func TestServiceNode(t *testing.T) {
-	nodes := []struct {
+	cases := []struct {
 		in  *model.Proxy
 		out string
 	}{
 		{
-			in:  &memory.HelloProxyV0,
+			in:  &mock.HelloProxyV0,
 			out: "sidecar~10.1.1.0~v0.default~default.svc.cluster.local",
 		},
 		{
 			in: &model.Proxy{
-				Type:        model.Ingress,
-				ID:          "random",
-				IPAddresses: []string{"10.3.3.3"},
-				DNSDomains:  []string{"local"},
+				Type:         model.Router,
+				ID:           "random",
+				IPAddresses:  []string{"10.3.3.3"},
+				DNSDomain:    "local",
+				Metadata:     &model.NodeMetadata{},
+				IstioVersion: model.MaxIstioVersion,
 			},
-			out: "ingress~10.3.3.3~random~local",
+			out: "router~10.3.3.3~random~local",
 		},
 		{
 			in: &model.Proxy{
 				Type:        model.SidecarProxy,
 				ID:          "random",
 				IPAddresses: []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6"},
-				DNSDomains:  []string{"local"},
-				Metadata: map[string]string{
-					"INSTANCE_IPS": "10.3.3.3,10.4.4.4,10.5.5.5,10.6.6.6",
+				DNSDomain:   "local",
+				Metadata: &model.NodeMetadata{
+					InstanceIPs: []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6"},
 				},
+				IstioVersion: model.MaxIstioVersion,
 			},
 			out: "sidecar~10.3.3.3~random~local",
 		},
 	}
 
-	for _, node := range nodes {
-		out := node.in.ServiceNode()
-		if out != node.out {
-			t.Errorf("%#v.ServiceNode() => Got %s, want %s", node.in, out, node.out)
-		}
+	for _, node := range cases {
 		in, err := model.ParseServiceNodeWithMetadata(node.out, node.in.Metadata)
-
 		if err != nil {
 			t.Errorf("ParseServiceNode(%q) => Got error %v", node.out, err)
 		}
@@ -72,130 +80,500 @@ func TestServiceNode(t *testing.T) {
 	}
 }
 
-func TestGetUniqueSuffixes(t *testing.T) {
-	data := []struct {
-		in  []string
-		out []string
+func TestParseMetadata(t *testing.T) {
+	cases := []struct {
+		name     string
+		metadata map[string]any
+		out      *model.Proxy
 	}{
 		{
-			in:  []string{"part1.part2.com", "part2.com", "default.svc.local", "kube.default.svc.local"},
-			out: []string{"part1.part2.com", "kube.default.svc.local"},
+			name: "Basic Case",
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+				Metadata: &model.NodeMetadata{Raw: map[string]any{}},
+			},
 		},
 		{
-			in:  []string{"global", "istio-system.global", "global"},
-			out: []string{"istio-system.global"},
+			name:     "Capture Arbitrary Metadata",
+			metadata: map[string]any{"foo": "bar"},
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+				Metadata: &model.NodeMetadata{
+					Raw: map[string]any{
+						"foo": "bar",
+					},
+				},
+			},
+		},
+		{
+			name: "Capture Labels",
+			metadata: map[string]any{
+				"LABELS": map[string]string{
+					"foo": "bar",
+				},
+			},
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+				Metadata: &model.NodeMetadata{
+					Raw: map[string]any{
+						"LABELS": map[string]any{"foo": "bar"},
+					},
+					Labels: map[string]string{"foo": "bar"},
+				},
+			},
+		},
+		{
+			name: "Capture Pod Ports",
+			metadata: map[string]any{
+				"POD_PORTS": `[{"name":"http","containerPort":8080,"protocol":"TCP"},{"name":"grpc","containerPort":8079,"protocol":"TCP"}]`,
+			},
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+				Metadata: &model.NodeMetadata{
+					Raw: map[string]any{
+						"POD_PORTS": `[{"name":"http","containerPort":8080,"protocol":"TCP"},{"name":"grpc","containerPort":8079,"protocol":"TCP"}]`,
+					},
+					PodPorts: []model.PodPort{
+						{Name: "http", ContainerPort: 8080, Protocol: "TCP"},
+						{Name: "grpc", ContainerPort: 8079, Protocol: "TCP"},
+					},
+				},
+			},
 		},
 	}
-	for _, datum := range data {
-		out := model.GetUniqueSuffixes(datum.in)
-		if !reflect.DeepEqual(datum.out, out) {
-			t.Errorf("GetSuperString() =>\n Got %s\nwant %s", out, datum.out)
+
+	nodeID := "sidecar~1.1.1.1~id~domain"
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, err := mapToStruct(tt.metadata)
+			if err != nil {
+				t.Fatalf("failed to setup metadata: %v", err)
+			}
+			parsed, err := model.ParseMetadata(meta)
+			if err != nil {
+				t.Fatalf("failed to parse service node: %v", err)
+			}
+			node, err := model.ParseServiceNodeWithMetadata(nodeID, parsed)
+			if err != nil {
+				t.Fatalf("failed to parse service node: %v", err)
+			}
+			if !reflect.DeepEqual(*tt.out.Metadata, *node.Metadata) {
+				t.Errorf("Got \n%v, want \n%v", *node.Metadata, *tt.out.Metadata)
+			}
+		})
+	}
+}
+
+func mapToStruct(msg map[string]any) (*structpb.Struct, error) {
+	if msg == nil {
+		return &structpb.Struct{}, nil
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	pbs := &structpb.Struct{}
+	if err := protomarshal.Unmarshal(b, pbs); err != nil {
+		return nil, err
+	}
+
+	return pbs, nil
+}
+
+func TestGetOrDefault(t *testing.T) {
+	assert.Equal(t, "a", model.GetOrDefault("a", "b"))
+	assert.Equal(t, "b", model.GetOrDefault("", "b"))
+}
+
+func TestProxyVersion_Compare(t *testing.T) {
+	type fields struct {
+		Major int
+		Minor int
+		Patch int
+	}
+	type args struct {
+		inv *model.IstioVersion
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   int
+	}{
+		{
+			name:   "greater major",
+			fields: fields{Major: 2, Minor: 1, Patch: 1},
+			args:   args{&model.IstioVersion{Major: 1, Minor: 2, Patch: 1}},
+			want:   1,
+		},
+		{
+			name:   "equal at minor",
+			fields: fields{Major: 2, Minor: 1, Patch: 1},
+			args:   args{&model.IstioVersion{Major: 2, Minor: 1, Patch: -1}},
+			want:   0,
+		},
+		{
+			name:   "less at patch",
+			fields: fields{Major: 2, Minor: 1, Patch: 0},
+			args:   args{&model.IstioVersion{Major: 2, Minor: 1, Patch: 1}},
+			want:   -1,
+		},
+		{
+			name:   "ignore minor",
+			fields: fields{Major: 2, Minor: 1, Patch: 11},
+			args:   args{&model.IstioVersion{Major: 2, Minor: -1, Patch: 1}},
+			want:   0,
+		},
+		{
+			name:   "ignore patch",
+			fields: fields{Major: 2, Minor: 1, Patch: 11},
+			args:   args{&model.IstioVersion{Major: 2, Minor: 1, Patch: -1}},
+			want:   0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pversion := &model.IstioVersion{
+				Major: tt.fields.Major,
+				Minor: tt.fields.Minor,
+				Patch: tt.fields.Patch,
+			}
+			if got := pversion.Compare(tt.args.inv); got != tt.want {
+				t.Errorf("ProxyVersion.Compare() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_parseIstioVersion(t *testing.T) {
+	type args struct {
+		ver string
+	}
+	tests := []struct {
+		name string
+		args args
+		want *model.IstioVersion
+	}{
+		{
+			name: "major.minor.patch",
+			args: args{ver: "1.2.3"},
+			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 3},
+		},
+		{
+			name: "major.minor",
+			args: args{ver: "1.2"},
+			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 65535},
+		},
+		{
+			name: "dev",
+			args: args{ver: "1.5-alpha.f70faea2aa817eeec0b08f6cc3b5078e5dcf3beb"},
+			want: &model.IstioVersion{Major: 1, Minor: 5, Patch: 65535},
+		},
+		{
+			name: "release-major.minor-date",
+			args: args{ver: "release-1.2-123214234"},
+			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 65535},
+		},
+		{
+			name: "master-date",
+			args: args{ver: "master-123214234"},
+			want: model.MaxIstioVersion,
+		},
+		{
+			name: "master-sha",
+			args: args{ver: "master-0b94e017f5b6c7c4598a4da42ea9d45eeb099e5f"},
+			want: model.MaxIstioVersion,
+		},
+		{
+			name: "junk-major.minor.patch",
+			args: args{ver: "junk-1.2.3214234"},
+			want: model.MaxIstioVersion,
+		},
+		{
+			name: "junk-garbage",
+			args: args{ver: "junk-garbage"},
+			want: model.MaxIstioVersion,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := model.ParseIstioVersion(tt.args.ver); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseIstioVersion() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetServiceInstances(t *testing.T) {
+	tnow := time.Now()
+	dummyPort := &model.Port{Port: 80}
+	instances := []model.ServiceTarget{
+		{
+			Service: &model.Service{
+				CreationTime: tnow.Add(1 * time.Second),
+				Hostname:     host.Name("test1.com"),
+			},
+			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+		},
+		{
+			Service: &model.Service{
+				CreationTime: tnow,
+				Hostname:     host.Name("test3.com"),
+			},
+			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+		},
+		{
+			Service: &model.Service{
+				CreationTime: tnow,
+				Hostname:     host.Name("test2.com"),
+			},
+			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+		},
+	}
+
+	serviceDiscovery := memory.NewServiceDiscovery()
+	serviceDiscovery.WantGetProxyServiceTargets = instances
+
+	env := &model.Environment{
+		ServiceDiscovery: serviceDiscovery,
+	}
+
+	proxy := &model.Proxy{}
+	proxy.SetServiceTargets(env)
+
+	assert.Equal(t, len(proxy.ServiceTargets), 3)
+	assert.Equal(t, proxy.ServiceTargets[0].Service.Hostname, "test2.com")
+	assert.Equal(t, proxy.ServiceTargets[1].Service.Hostname, "test3.com")
+	assert.Equal(t, proxy.ServiceTargets[2].Service.Hostname, "test1.com")
+}
+
+func TestGlobalUnicastIP(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     []string
+		expect string
+	}{
+		{
+			name:   "single IPv4 (k8s)",
+			in:     []string{"10.0.4.16"},
+			expect: "10.0.4.16",
+		},
+		{
+			name:   "single IPv6 (k8s)",
+			in:     []string{"fc00:f853:ccd:e793::1"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+		{
+			name:   "multi IPv4 [1st] (VM)",
+			in:     []string{"10.128.0.51", "fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "10.128.0.51",
+		},
+		{
+			name:   "multi IPv6 [1st] (VM)",
+			in:     []string{"fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "10.128.0.51", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+		{
+			name:   "multi IPv4 [2nd] (VM)",
+			in:     []string{"127.0.0.1", "10.128.0.51", "fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "10.128.0.51",
+		},
+		{
+			name:   "multi IPv6 [2nd] (VM)",
+			in:     []string{"fe80::42:35ff:fec1:7436", "fc00:f853:ccd:e793::1", "172.17.0.1", "10.128.0.51", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var node model.Proxy
+			node.IPAddresses = tt.in
+			node.DiscoverIPMode()
+			if got := node.GlobalUnicastIP; got != tt.expect {
+				t.Errorf("GlobalUnicastIP = %v, want %v", got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestShouldCreateDoubleHBONEResources(t *testing.T) {
+	waypoint := func() *model.Proxy {
+		return &model.Proxy{
+			Type:     model.Waypoint,
+			Labels:   map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+			Metadata: &model.NodeMetadata{},
 		}
 	}
-}
-
-func TestParsePort(t *testing.T) {
-	if port := model.ParsePort("localhost:3000"); port != 3000 {
-		t.Errorf("ParsePort(localhost:3000) => Got %d, want 3000", port)
+	managedGateway := func() *model.Proxy {
+		return &model.Proxy{
+			Type:     model.Router,
+			Labels:   map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayControllerLabel},
+			Metadata: &model.NodeMetadata{},
+		}
 	}
-	if port := model.ParsePort("localhost"); port != 0 {
-		t.Errorf("ParsePort(localhost) => Got %d, want 0", port)
+	legacyGateway := func() *model.Proxy {
+		return &model.Proxy{
+			Type:     model.Router,
+			Labels:   map[string]string{constants.IstioLabel: constants.IstioIngressLabelValue},
+			Metadata: &model.NodeMetadata{},
+		}
 	}
-}
-
-func TestDefaultConfig(t *testing.T) {
-	config := model.DefaultProxyConfig()
-	if err := model.ValidateProxyConfig(&config); err != nil {
-		t.Errorf("validation of default proxy config failed with %v", err)
+	eastWestGateway := func() *model.Proxy {
+		return &model.Proxy{
+			Type:     model.Waypoint,
+			Labels:   map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayEastWestControllerLabel},
+			Metadata: &model.NodeMetadata{},
+		}
 	}
-}
-
-func TestDefaultMeshConfig(t *testing.T) {
-	mesh := model.DefaultMeshConfig()
-	if err := model.ValidateMeshConfig(&mesh); err != nil {
-		t.Errorf("validation of default mesh config failed with %v", err)
+	disableHBONESend := func(p *model.Proxy) *model.Proxy {
+		p.Metadata.DisableHBONESend = true
+		return p
 	}
-}
 
-func TestApplyMeshConfigDefaults(t *testing.T) {
-	configPath := "/test/config/patch"
-	yaml := fmt.Sprintf(`
-defaultConfig:
-  configPath: %s
-`, configPath)
-
-	want := model.DefaultMeshConfig()
-	want.DefaultConfig.ConfigPath = configPath
-
-	got, err := model.ApplyMeshConfigDefaults(yaml)
-	if err != nil {
-		t.Fatalf("ApplyMeshConfigDefaults() failed: %v", err)
-	}
-	if !reflect.DeepEqual(got, &want) {
-		t.Fatalf("Wrong default values:\n got %#v \nwant %#v", got, &want)
-	}
-}
-
-func TestApplyMeshNetworksDefaults(t *testing.T) {
-	yml := fmt.Sprintf(`
-networks:
-  network1:
-    endpoints:
-    - fromCidr: "192.168.0.1/24"
-    gateways:
-    - address: 1.1.1.1
-      port: 80
-  network2:
-    endpoints:
-    - fromRegistry: reg1
-    gateways:
-    - registryServiceName: reg1
-      port: 443
-`)
-
-	want := model.EmptyMeshNetworks()
-	want.Networks = map[string]*meshconfig.Network{
-		"network1": {
-			Endpoints: []*meshconfig.Network_NetworkEndpoints{
-				{
-					Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
-						FromCidr: "192.168.0.1/24",
-					},
-				},
-			},
-			Gateways: []*meshconfig.Network_IstioNetworkGateway{
-				{
-					Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-						Address: "1.1.1.1",
-					},
-					Port: 80,
-				},
-			},
+	cases := []struct {
+		name             string
+		proxy            *model.Proxy
+		multiNet         bool
+		waypointMultiNet bool
+		ingressMultiNet  bool
+		hboneSend        bool
+		expect           bool
+	}{
+		{
+			name:             "waypoint, multi-network off",
+			proxy:            waypoint(),
+			multiNet:         false,
+			waypointMultiNet: true,
+			hboneSend:        true,
+			expect:           false,
 		},
-		"network2": {
-			Endpoints: []*meshconfig.Network_NetworkEndpoints{
-				{
-					Ne: &meshconfig.Network_NetworkEndpoints_FromRegistry{
-						FromRegistry: "reg1",
-					},
-				},
-			},
-			Gateways: []*meshconfig.Network_IstioNetworkGateway{
-				{
-					Gw: &meshconfig.Network_IstioNetworkGateway_RegistryServiceName{
-						RegistryServiceName: "reg1",
-					},
-					Port: 443,
-				},
-			},
+		{
+			name:             "waypoint, multi-network on",
+			proxy:            waypoint(),
+			multiNet:         true,
+			waypointMultiNet: true,
+			hboneSend:        true,
+			expect:           true,
+		},
+		{
+			name:             "waypoint, multi-network on but waypoint multi-network off",
+			proxy:            waypoint(),
+			multiNet:         true,
+			waypointMultiNet: false,
+			hboneSend:        true,
+			expect:           false,
+		},
+		{
+			name:             "waypoint, HBONE send off for this proxy",
+			proxy:            disableHBONESend(waypoint()),
+			multiNet:         true,
+			waypointMultiNet: true,
+			hboneSend:        true,
+			expect:           true,
+		},
+		{
+			name:             "waypoint, HBONE send off mesh-wide",
+			proxy:            waypoint(),
+			multiNet:         true,
+			waypointMultiNet: true,
+			hboneSend:        false,
+			expect:           true,
+		},
+		{
+			name:             "waypoint type without the managed gateway label",
+			proxy:            &model.Proxy{Type: model.Waypoint, Metadata: &model.NodeMetadata{}},
+			multiNet:         true,
+			waypointMultiNet: true,
+			hboneSend:        true,
+			expect:           false,
+		},
+		{
+			name:             "ambient east-west gateway",
+			proxy:            eastWestGateway(),
+			multiNet:         true,
+			waypointMultiNet: true,
+			ingressMultiNet:  true,
+			hboneSend:        true,
+			expect:           false,
+		},
+		{
+			name:            "managed gateway, multi-network off",
+			proxy:           managedGateway(),
+			multiNet:        false,
+			ingressMultiNet: true,
+			hboneSend:       true,
+			expect:          false,
+		},
+		{
+			name:            "managed gateway, multi-network on",
+			proxy:           managedGateway(),
+			multiNet:        true,
+			ingressMultiNet: true,
+			hboneSend:       true,
+			expect:          true,
+		},
+		{
+			name:            "managed gateway, multi-network on but ingress multi-network off",
+			proxy:           managedGateway(),
+			multiNet:        true,
+			ingressMultiNet: false,
+			hboneSend:       true,
+			expect:          false,
+		},
+		{
+			name:            "managed gateway, HBONE send off for this proxy",
+			proxy:           disableHBONESend(managedGateway()),
+			multiNet:        true,
+			ingressMultiNet: true,
+			hboneSend:       true,
+			expect:          false,
+		},
+		{
+			name:            "managed gateway, HBONE send off mesh-wide",
+			proxy:           managedGateway(),
+			multiNet:        true,
+			ingressMultiNet: true,
+			hboneSend:       false,
+			expect:          false,
+		},
+		{
+			name:            "legacy labeled gateway, multi-network on",
+			proxy:           legacyGateway(),
+			multiNet:        true,
+			ingressMultiNet: true,
+			hboneSend:       true,
+			expect:          true,
+		},
+		{
+			name:             "sidecar is never given double HBONE resources",
+			proxy:            &model.Proxy{Type: model.SidecarProxy, Metadata: &model.NodeMetadata{}},
+			multiNet:         true,
+			waypointMultiNet: true,
+			ingressMultiNet:  true,
+			hboneSend:        true,
+			expect:           false,
+		},
+		{
+			name:             "nil proxy",
+			proxy:            nil,
+			multiNet:         true,
+			waypointMultiNet: true,
+			ingressMultiNet:  true,
+			hboneSend:        true,
+			expect:           false,
 		},
 	}
 
-	got, err := model.LoadMeshNetworksConfig(yml)
-	if err != nil {
-		t.Fatalf("ApplyMeshNetworksDefaults() failed: %v", err)
-	}
-	if !reflect.DeepEqual(got, &want) {
-		t.Fatalf("Wrong values:\n got %#v \nwant %#v", got, &want)
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableHBONESend, tt.hboneSend)
+			test.SetForTest(t, &features.EnableAmbientMultiNetwork, tt.multiNet)
+			test.SetForTest(t, &features.EnableAmbientWaypointMultiNetwork, tt.waypointMultiNet)
+			test.SetForTest(t, &features.EnableAmbientIngressMultiNetwork, tt.ingressMultiNet)
+
+			assert.Equal(t, model.ShouldCreateDoubleHBONEResources(tt.proxy), tt.expect)
+		})
 	}
 }

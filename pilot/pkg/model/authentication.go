@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,263 +16,305 @@ package model
 
 import (
 	"fmt"
-	"net/url"
-	"strconv"
+	"time"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/config/grpc_credential/v2alpha"
-	"github.com/gogo/protobuf/types"
-
-	authn "istio.io/api/authentication/v1alpha1"
+	"istio.io/api/security/v1beta1"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/hash"
+	"istio.io/istio/pkg/util/sets"
 )
+
+// MutualTLSMode is the mutual TLS mode specified by authentication policy.
+type MutualTLSMode int
 
 const (
-	// SDSStatPrefix is the human readable prefix to use when emitting statistics for the SDS service.
-	SDSStatPrefix = "sdsstat"
+	// MTLSUnknown is used to indicate the variable hasn't been initialized correctly (with the authentication policy).
+	MTLSUnknown MutualTLSMode = iota
 
-	// SDSDefaultResourceName is the default name in sdsconfig, used for fetching normal key/cert.
-	SDSDefaultResourceName = "default"
+	// MTLSDisable if authentication policy disable mTLS.
+	MTLSDisable
 
-	// SDSRootResourceName is the sdsconfig name for root CA, used for fetching root cert.
-	SDSRootResourceName = "ROOTCA"
+	// MTLSPermissive if authentication policy enable mTLS in permissive mode.
+	MTLSPermissive
 
-	// K8sSATrustworthyJwtFileName is the token volume mount file name for k8s trustworthy jwt token.
-	K8sSATrustworthyJwtFileName = "/var/run/secrets/tokens/istio-token"
-
-	// K8sSAJwtFileName is the token volume mount file name for k8s jwt token.
-	K8sSAJwtFileName = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-
-	// fileBasedMetadataPlugName is File Based Metadata credentials plugin name.
-	fileBasedMetadataPlugName = "envoy.grpc_credentials.file_based_metadata"
-
-	// k8sSAJwtTokenHeaderKey is the request header key for k8s jwt token.
-	// Binary header name must has suffix "-bin", according to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
-	k8sSAJwtTokenHeaderKey = "istio_sds_credentials_header-bin"
-
-	// IngressGatewaySdsUdsPath is the UDS path for ingress gateway to get credentials via SDS.
-	IngressGatewaySdsUdsPath = "unix:/var/run/ingress_gateway/sds"
-
-	// IngressGatewaySdsCaSuffix is the suffix of the sds resource name for root CA.
-	IngressGatewaySdsCaSuffix = "-cacert"
+	// MTLSStrict if authentication policy enable mTLS in strict mode.
+	MTLSStrict
 )
 
-// JwtKeyResolver resolves JWT public key and JwksURI.
-var JwtKeyResolver = newJwksResolver(JwtPubKeyExpireDuration, JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
+// In Ambient, we convert k8s PeerAuthentication resources to the same type as AuthorizationPolicies
+// To prevent conflicts in xDS, we add this prefix to the converted PeerAuthentication resources.
+const convertedPeerAuthenticationPrefix = "converted_peer_authentication_" // use '_' character since those are illegal in k8s names
 
-// GetConsolidateAuthenticationPolicy returns the authentication policy for
-// service specified by hostname and port, if defined. It also tries to resolve JWKS URI if necessary.
-func GetConsolidateAuthenticationPolicy(store IstioConfigStore, service *Service, port *Port) *authn.Policy {
-	config := store.AuthenticationPolicyByDestination(service, port)
-	if config != nil {
-		policy := config.Spec.(*authn.Policy)
-		if err := JwtKeyResolver.SetAuthenticationPolicyJwksURIs(policy); err == nil {
-			return policy
-		}
-	}
-
-	return nil
-}
-
-// ConstructSdsSecretConfig constructs SDS secret configuration for ingress gateway.
-func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.SdsSecretConfig {
-	if name == "" || sdsUdsPath == "" {
-		return nil
-	}
-
-	gRPCConfig := &core.GrpcService_GoogleGrpc{
-		TargetUri:  sdsUdsPath,
-		StatPrefix: SDSStatPrefix,
-	}
-
-	return &auth.SdsSecretConfig{
-		Name: name,
-		SdsConfig: &core.ConfigSource{
-			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-				ApiConfigSource: &core.ApiConfigSource{
-					ApiType: core.ApiConfigSource_GRPC,
-					GrpcServices: []*core.GrpcService{
-						{
-							TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-								GoogleGrpc: gRPCConfig,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// ConstructSdsSecretConfig constructs SDS Sececret Configuration for workload proxy.
-func ConstructSdsSecretConfig(name, sdsUdsPath string, useK8sSATrustworthyJwt, useK8sSANormalJwt bool, metadata map[string]string) *auth.SdsSecretConfig {
-	if name == "" || sdsUdsPath == "" {
-		return nil
-	}
-
-	gRPCConfig := &core.GrpcService_GoogleGrpc{
-		TargetUri:  sdsUdsPath,
-		StatPrefix: SDSStatPrefix,
-		ChannelCredentials: &core.GrpcService_GoogleGrpc_ChannelCredentials{
-			CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
-				LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
-			},
-		},
-	}
-
-	// If metadata[NodeMetadataSdsTokenPath] is non-empty, envoy will fetch tokens from metadata[NodeMetadataSdsTokenPath].
-	// Otherwise, if useK8sSATrustworthyJwt is set, envoy will fetch and pass k8s sa trustworthy jwt(which is available for k8s 1.10 or higher),
-	// pass it to SDS server to request key/cert; if trustworthy jwt isn't available, envoy will fetch and pass normal k8s sa jwt to
-	// request key/cert.
-	if sdsTokenPath, found := metadata[NodeMetadataSdsTokenPath]; found && len(sdsTokenPath) > 0 {
-		log.Debugf("SDS token path is (%v)", sdsTokenPath)
-		gRPCConfig.CredentialsFactoryName = fileBasedMetadataPlugName
-		gRPCConfig.CallCredentials = constructgRPCCallCredentials(sdsTokenPath, k8sSAJwtTokenHeaderKey)
-	} else if useK8sSATrustworthyJwt {
-		gRPCConfig.CredentialsFactoryName = fileBasedMetadataPlugName
-		gRPCConfig.CallCredentials = constructgRPCCallCredentials(K8sSATrustworthyJwtFileName, k8sSAJwtTokenHeaderKey)
-	} else if useK8sSANormalJwt {
-		gRPCConfig.CredentialsFactoryName = fileBasedMetadataPlugName
-		gRPCConfig.CallCredentials = constructgRPCCallCredentials(K8sSAJwtFileName, k8sSAJwtTokenHeaderKey)
-	} else {
-		gRPCConfig.CallCredentials = []*core.GrpcService_GoogleGrpc_CallCredentials{
-			&core.GrpcService_GoogleGrpc_CallCredentials{
-				CredentialSpecifier: &core.GrpcService_GoogleGrpc_CallCredentials_GoogleComputeEngine{
-					GoogleComputeEngine: &types.Empty{},
-				},
-			},
-		}
-	}
-
-	return &auth.SdsSecretConfig{
-		Name: name,
-		SdsConfig: &core.ConfigSource{
-			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-				ApiConfigSource: &core.ApiConfigSource{
-					ApiType: core.ApiConfigSource_GRPC,
-					GrpcServices: []*core.GrpcService{
-						{
-							TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-								GoogleGrpc: gRPCConfig,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// ConstructValidationContext constructs ValidationContext in CommonTlsContext.
-func ConstructValidationContext(rootCAFilePath string, subjectAltNames []string) *auth.CommonTlsContext_ValidationContext {
-	ret := &auth.CommonTlsContext_ValidationContext{
-		ValidationContext: &auth.CertificateValidationContext{
-			TrustedCa: &core.DataSource{
-				Specifier: &core.DataSource_Filename{
-					Filename: rootCAFilePath,
-				},
-			},
-		},
-	}
-
-	if len(subjectAltNames) > 0 {
-		ret.ValidationContext.VerifySubjectAltName = subjectAltNames
-	}
-
-	return ret
-}
-
-// ParseJwksURI parses the input URI and returns the corresponding hostname, port, and whether SSL is used.
-// URI must start with "http://" or "https://", which corresponding to "http" or "https" scheme.
-// Port number is extracted from URI if available (i.e from postfix :<port>, eg. ":80"), or assigned
-// to a default value based on URI scheme (80 for http and 443 for https).
-// Port name is set to URI scheme value.
-// Note: this is to replace [buildJWKSURIClusterNameAndAddress]
-// (https://github.com/istio/istio/blob/master/pilot/pkg/proxy/envoy/v1/mixer.go#L401),
-// which is used for the old EUC policy.
-func ParseJwksURI(jwksURI string) (string, *Port, bool, error) {
-	u, err := url.Parse(jwksURI)
-	if err != nil {
-		return "", nil, false, err
-	}
-	var useSSL bool
-	var portNumber int
-	switch u.Scheme {
-	case "http":
-		useSSL = false
-		portNumber = 80
-	case "https":
-		useSSL = true
-		portNumber = 443
+// String converts MutualTLSMode to human readable string for debugging.
+func (mode MutualTLSMode) String() string {
+	switch mode {
+	case MTLSDisable:
+		return "DISABLE"
+	case MTLSPermissive:
+		return "PERMISSIVE"
+	case MTLSStrict:
+		return "STRICT"
 	default:
-		return "", nil, false, fmt.Errorf("URI scheme %q is not supported", u.Scheme)
+		return "UNKNOWN"
+	}
+}
+
+// ConvertToMutualTLSMode converts from peer authn MTLS mode (`PeerAuthentication_MutualTLS_Mode`)
+// to the MTLS mode specified by authn policy.
+func ConvertToMutualTLSMode(mode v1beta1.PeerAuthentication_MutualTLS_Mode) MutualTLSMode {
+	switch mode {
+	case v1beta1.PeerAuthentication_MutualTLS_DISABLE:
+		return MTLSDisable
+	case v1beta1.PeerAuthentication_MutualTLS_PERMISSIVE:
+		return MTLSPermissive
+	case v1beta1.PeerAuthentication_MutualTLS_STRICT:
+		return MTLSStrict
+	default:
+		return MTLSUnknown
+	}
+}
+
+// AuthenticationPolicies organizes authentication (mTLS + JWT) policies by namespace.
+type AuthenticationPolicies struct {
+	// Maps from namespace to the v1beta1 authentication policies.
+	requestAuthentications map[string][]config.Config
+
+	peerAuthentications map[string][]config.Config
+
+	// namespaceMutualTLSMode is the MutualTLSMode corresponding to the namespace-level PeerAuthentication.
+	// All namespace-level policies, and only them, are added to this map. If the policy mTLS mode is set
+	// to UNSET, it will be resolved to the value set by mesh policy if exist (i.e not UNKNOWN), or MTLSPermissive
+	// otherwise.
+	namespaceMutualTLSMode map[string]MutualTLSMode
+
+	// globalMutualTLSMode is the MutualTLSMode corresponding to the mesh-level PeerAuthentication.
+	// This value can be MTLSUnknown, if there is no mesh-level policy.
+	globalMutualTLSMode MutualTLSMode
+
+	rootNamespace string
+
+	// aggregateVersion contains the versions of all peer authentications.
+	aggregateVersion string
+}
+
+type PeerAuthnPolicies interface {
+	GetPeerAuthenticationsForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config
+	GetNamespaceMutualTLSMode(namespace string) MutualTLSMode
+	GetPeerAuthentications() map[string][]config.Config
+	GetGlobalMutualTLSMode() MutualTLSMode
+	GetRootNamespace() string
+	GetVersion() string
+}
+
+// initAuthenticationPolicies creates a new AuthenticationPolicies struct and populates with the
+// authentication policies in the mesh environment.
+func initAuthenticationPolicies(env *Environment) *AuthenticationPolicies {
+	policy := &AuthenticationPolicies{
+		requestAuthentications: map[string][]config.Config{},
+		peerAuthentications:    map[string][]config.Config{},
+		globalMutualTLSMode:    MTLSUnknown,
+		rootNamespace:          env.Mesh().GetRootNamespace(),
 	}
 
-	if u.Port() != "" {
-		portNumber, err = strconv.Atoi(u.Port())
-		if err != nil {
-			return "", nil, useSSL, err
+	policy.addRequestAuthentication(sortConfigByCreationTime(env.List(gvk.RequestAuthentication, NamespaceAll)))
+	policy.addPeerAuthentication(sortConfigByCreationTime(env.List(gvk.PeerAuthentication, NamespaceAll)))
+
+	return policy
+}
+
+func (policy *AuthenticationPolicies) addRequestAuthentication(configs []config.Config) {
+	for _, config := range configs {
+		policy.requestAuthentications[config.Namespace] = append(policy.requestAuthentications[config.Namespace], config)
+	}
+}
+
+func (policy *AuthenticationPolicies) addPeerAuthentication(configs []config.Config) {
+	// Sort configs in ascending order by their creation time.
+	sortConfigByCreationTime(configs)
+
+	foundNamespaceMTLS := make(map[string]v1beta1.PeerAuthentication_MutualTLS_Mode)
+	// Track which namespace/mesh level policy seen so far to make sure the oldest one is used.
+	seenNamespaceOrMeshConfig := make(map[string]time.Time)
+
+	var versionSum uint64
+	hash := hash.New()
+	for _, config := range configs {
+		hash.WriteString(config.UID + "." + config.ResourceVersion)
+		versionSum += hash.Sum64()
+		hash.Reset()
+		// Mesh & namespace level policy are those that have empty selector.
+		spec := config.Spec.(*v1beta1.PeerAuthentication)
+		if spec.Selector == nil || len(spec.Selector.MatchLabels) == 0 {
+			if t, ok := seenNamespaceOrMeshConfig[config.Namespace]; ok {
+				log.Warnf(
+					"Namespace/mesh-level PeerAuthentication is already defined for %q at time %v. Ignore %q which was created at time %v",
+					config.Namespace, t, config.Name, config.CreationTimestamp)
+				continue
+			}
+			seenNamespaceOrMeshConfig[config.Namespace] = config.CreationTimestamp
+
+			mode := v1beta1.PeerAuthentication_MutualTLS_UNSET
+			if spec.Mtls != nil {
+				mode = spec.Mtls.Mode
+			}
+			if config.Namespace == policy.rootNamespace {
+				// This is mesh-level policy. UNSET is treated as permissive for mesh-policy.
+				if mode == v1beta1.PeerAuthentication_MutualTLS_UNSET {
+					policy.globalMutualTLSMode = MTLSPermissive
+				} else {
+					policy.globalMutualTLSMode = ConvertToMutualTLSMode(mode)
+				}
+			} else {
+				// For regular namespace, just add to the intermediate map.
+				foundNamespaceMTLS[config.Namespace] = mode
+			}
+		}
+
+		// Add the config to the map by namespace for future look up. This is done after namespace/mesh
+		// singleton check so there should be at most one namespace/mesh config is added to the map.
+		policy.peerAuthentications[config.Namespace] = append(policy.peerAuthentications[config.Namespace], config)
+	}
+
+	hash.WriteString(fmt.Sprintf("%016x", versionSum))
+	policy.aggregateVersion = hash.Sum()
+
+	// Process found namespace-level policy.
+	policy.namespaceMutualTLSMode = make(map[string]MutualTLSMode, len(foundNamespaceMTLS))
+
+	inheritedMTLSMode := policy.globalMutualTLSMode
+	if inheritedMTLSMode == MTLSUnknown {
+		// If the mesh policy is not explicitly presented, use default value MTLSPermissive.
+		inheritedMTLSMode = MTLSPermissive
+	}
+	for ns, mtlsMode := range foundNamespaceMTLS {
+		if mtlsMode == v1beta1.PeerAuthentication_MutualTLS_UNSET {
+			policy.namespaceMutualTLSMode[ns] = inheritedMTLSMode
+		} else {
+			policy.namespaceMutualTLSMode[ns] = ConvertToMutualTLSMode(mtlsMode)
+		}
+	}
+}
+
+// GetNamespaceMutualTLSMode returns the MutualTLSMode as defined by a namespace or mesh level
+// PeerAuthentication. The return value could be `MTLSUnknown` if there is no mesh nor namespace
+// PeerAuthentication policy for the given namespace.
+func (policy *AuthenticationPolicies) GetNamespaceMutualTLSMode(namespace string) MutualTLSMode {
+	if mode, ok := policy.namespaceMutualTLSMode[namespace]; ok {
+		return mode
+	}
+	return policy.globalMutualTLSMode
+}
+
+// GetJwtPoliciesForWorkload returns a list of JWT policies matching to labels.
+func (policy *AuthenticationPolicies) GetJwtPoliciesForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config {
+	return getConfigsForWorkload(policy.rootNamespace, policy.requestAuthentications, policyMatcher)
+}
+
+// GetPeerAuthenticationsForWorkload returns a list of peer authentication policies matching to labels.
+func (policy *AuthenticationPolicies) GetPeerAuthenticationsForWorkload(policyMatcher WorkloadPolicyMatcher) []*config.Config {
+	return getConfigsForWorkload(policy.rootNamespace, policy.peerAuthentications, policyMatcher)
+}
+
+// GetRootNamespace return root namespace that is tracked by the policy object.
+func (policy *AuthenticationPolicies) GetRootNamespace() string {
+	return policy.rootNamespace
+}
+
+// GetVersion return versions of all peer authentications..
+func (policy *AuthenticationPolicies) GetVersion() string {
+	return policy.aggregateVersion
+}
+
+func GetAmbientPolicyConfigName(key ConfigKey) string {
+	switch key.Kind {
+	case kind.PeerAuthentication:
+		return convertedPeerAuthenticationPrefix + key.Name
+	default:
+		return key.Name
+	}
+}
+
+func (policy *AuthenticationPolicies) GetPeerAuthentications() map[string][]config.Config {
+	return policy.peerAuthentications
+}
+
+func (policy *AuthenticationPolicies) GetGlobalMutualTLSMode() MutualTLSMode {
+	return policy.globalMutualTLSMode
+}
+
+// FilterPeerAuthenticationNamespaces creates a new AuthenticationPolicies containing only
+// PeerAuthentication policies from the specified namespaces.
+func (policy *AuthenticationPolicies) FilterPeerAuthenticationNamespaces(namespaces sets.Set[string]) PeerAuthnPolicies {
+	filtered := &AuthenticationPolicies{
+		peerAuthentications:    make(map[string][]config.Config, len(namespaces)+1),
+		namespaceMutualTLSMode: make(map[string]MutualTLSMode, len(namespaces)+1),
+		globalMutualTLSMode:    policy.globalMutualTLSMode,
+		rootNamespace:          policy.rootNamespace,
+		aggregateVersion:       policy.aggregateVersion,
+	}
+
+	var versionSum uint64
+	h := hash.New()
+	for ns := range namespaces {
+		if configs, ok := policy.peerAuthentications[ns]; ok {
+			filtered.peerAuthentications[ns] = configs
+			for _, cfg := range configs {
+				h.WriteString(cfg.UID + "." + cfg.ResourceVersion)
+				versionSum += h.Sum64()
+				h.Reset()
+			}
+		}
+		if mode, ok := policy.namespaceMutualTLSMode[ns]; ok {
+			filtered.namespaceMutualTLSMode[ns] = mode
 		}
 	}
 
-	return u.Hostname(), &Port{
-		Name: u.Scheme,
-		Port: portNumber,
-	}, useSSL, nil
+	h.WriteString(fmt.Sprintf("%016x", versionSum))
+	filtered.aggregateVersion = h.Sum()
+
+	return filtered
 }
 
-// this function is used to construct SDS config which is only available from 1.1
-func constructgRPCCallCredentials(tokenFileName, headerKey string) []*core.GrpcService_GoogleGrpc_CallCredentials {
-	// If k8s sa jwt token file exists, envoy only handles plugin credentials.
-	config := &v2alpha.FileBasedMetadataConfig{
-		SecretData: &core.DataSource{
-			Specifier: &core.DataSource_Filename{
-				Filename: tokenFileName,
-			},
-		},
-		HeaderKey: headerKey,
+func getConfigsForWorkload(rootNamespace string, configsByNamespace map[string][]config.Config, selectionOpts WorkloadPolicyMatcher) []*config.Config {
+	workloadLabels := selectionOpts.WorkloadLabels
+	namespace := selectionOpts.WorkloadNamespace
+	configs := make([]*config.Config, 0)
+	lookupInNamespaces := []string{namespace, rootNamespace}
+	for _, svc := range selectionOpts.Services {
+		lookupInNamespaces = append(lookupInNamespaces, svc.Namespace)
+	}
+	for _, ns := range slices.FilterDuplicates(lookupInNamespaces) {
+		if nsConfig, ok := configsByNamespace[ns]; ok {
+			for idx := range nsConfig {
+				cfg := &nsConfig[idx]
+				if ns != cfg.Namespace {
+					// Should never come here. Log warning just in case.
+					log.Warnf("Seeing config %s with namespace %s in map entry for %s. Ignored", cfg.Name, cfg.Namespace, ns)
+					continue
+				}
+				switch cfg.GroupVersionKind {
+				case gvk.RequestAuthentication:
+					ra := cfg.Spec.(*v1beta1.RequestAuthentication)
+					should := selectionOpts.WithRootNamespace(rootNamespace).ShouldAttachPolicy(cfg.GroupVersionKind, cfg.NamespacedName(), ra)
+					if should {
+						configs = append(configs, cfg)
+					}
+				case gvk.PeerAuthentication:
+					selector := labels.Instance(cfg.Spec.(*v1beta1.PeerAuthentication).GetSelector().GetMatchLabels())
+					if selector.SubsetOf(workloadLabels) {
+						configs = append(configs, cfg)
+					}
+				default:
+					log.Warnf("Not support authentication type %q", cfg.GroupVersionKind)
+					continue
+				}
+			}
+		}
 	}
 
-	any := findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey, config)
-
-	return []*core.GrpcService_GoogleGrpc_CallCredentials{
-		&core.GrpcService_GoogleGrpc_CallCredentials{
-			CredentialSpecifier: &core.GrpcService_GoogleGrpc_CallCredentials_FromPlugin{
-				FromPlugin: &core.GrpcService_GoogleGrpc_CallCredentials_MetadataCredentialsFromPlugin{
-					Name: fileBasedMetadataPlugName,
-					ConfigType: &core.GrpcService_GoogleGrpc_CallCredentials_MetadataCredentialsFromPlugin_TypedConfig{
-						TypedConfig: any},
-				},
-			},
-		},
-	}
-}
-
-type fbMetadataAnyKey struct {
-	tokenFileName string
-	headerKey     string
-}
-
-var fileBasedMetadataConfigAnyMap = map[fbMetadataAnyKey]*types.Any{}
-
-// findOrMarshalFileBasedMetadataConfig searches google.protobuf.Any in fileBasedMetadataConfigAnyMap
-// by tokenFileName and headerKey, and returns google.protobuf.Any proto if found. If not found,
-// it takes the fbMetadata and marshals it into google.protobuf.Any, and stores this new
-// google.protobuf.Any into fileBasedMetadataConfigAnyMap.
-// FileBasedMetadataConfig only supports non-deterministic marshaling. As each SDS config contains
-// marshaled FileBasedMetadataConfig, the SDS config would differ if marshaling FileBasedMetadataConfig
-// returns different result. Once SDS config differs, Envoy will create multiple SDS clients to fetch
-// same SDS resource. To solve this problem, we use findOrMarshalFileBasedMetadataConfig so that
-// FileBasedMetadataConfig is marshaled once, and is reused in all SDS configs.
-func findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey string, fbMetadata *v2alpha.FileBasedMetadataConfig) *types.Any {
-	key := fbMetadataAnyKey{
-		tokenFileName: tokenFileName,
-		headerKey:     headerKey,
-	}
-	if marshalAny, found := fileBasedMetadataConfigAnyMap[key]; found {
-		return marshalAny
-	}
-	any, _ := types.MarshalAny(fbMetadata)
-	fileBasedMetadataConfigAnyMap[key] = any
-	return any
+	return configs
 }

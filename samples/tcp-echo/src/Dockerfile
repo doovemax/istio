@@ -13,13 +13,13 @@
 #   limitations under the License.
 
 # build a tcp-echo binary using the golang container
-FROM golang:1.11 as builder
+FROM golang:1.22 AS builder
 WORKDIR /go/src/istio.io/tcp-echo-server/
 COPY main.go .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o tcp-echo main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags '-extldflags -static -s -w' -o tcp-echo main.go
 
-# copy the tcp-echo binary to a separate container based on scratch
 FROM scratch
+
 WORKDIR /bin/
 COPY --from=builder /go/src/istio.io/tcp-echo-server/tcp-echo .
 ENTRYPOINT [ "/bin/tcp-echo" ]
